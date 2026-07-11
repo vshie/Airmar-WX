@@ -144,7 +144,8 @@
   <script>
 (function () {
   const STALE_SEC = 15;
-  const HISTORY_POLL_MS = 4000;
+  const HISTORY_POLL_MS = 1000;
+  const HISTORY_KEYS = 'wind_apparent_paired,wind_true_paired';
 
   const defaultSensor = () => ({
     wind_apparent: { speed_kts: null, angle: null, source: null, timestamp: null },
@@ -344,7 +345,7 @@
 
   async function fetchHistory() {
     try {
-      const r = await fetch('/api/sensor/history');
+      const r = await fetch('/api/sensor/history?keys=' + encodeURIComponent(HISTORY_KEYS));
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
       history.wind_apparent_paired = Array.isArray(data.wind_apparent_paired)

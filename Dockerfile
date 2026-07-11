@@ -81,7 +81,7 @@ LABEL permissions='\
     "CpuPeriod": 100000,\
     "CpuQuota": 100000,\
     "Binds": [\
-      "/usr/blueos/extensions/airmar-wx:/app/logs",\
+      "/usr/blueos/extensions/300WX:/app/logs",\
       "/dev:/dev"\
     ],\
     "ExtraHosts": ["host.docker.internal:host-gateway"],\

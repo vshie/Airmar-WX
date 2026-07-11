@@ -23,6 +23,16 @@ try:
 except ImportError:
     HAS_WEBSOCKETS = False
 
+try:
+    from mavlink_sender import (
+        DEFAULT_FRESH_S as _MAV_DEFAULT_FRESH_S,
+        MavlinkSender,
+        NAMED_VALUE_OFFSETS as _MAV_NVF_OFFSETS,
+    )
+    HAS_MAVLINK_SENDER = True
+except ImportError:
+    HAS_MAVLINK_SENDER = False
+
 app = Flask(__name__, static_folder='static')
 CORS(app)
 
@@ -183,6 +193,22 @@ class NMEAHandler:
         self._ws_loop = None
         if HAS_WEBSOCKETS:
             self._start_ws_server()
+
+        # mavlink2rest NAMED_VALUE_FLOAT publisher. This is what gets the
+        # apparent / true wind into the autopilot's .BIN log as `NVF` rows
+        # (WX_AppDir, WX_AppSpd, WX_TruDir, WX_TruSpd) -- independent of the
+        # UDP NMEA stream so the log keeps recording even when the user has
+        # the UDP stream toggled off, and named distinctly from ArduPilot's
+        # own AppWndSpd / AppWndDir wind-vane emissions so the two streams
+        # can be cross-checked post-flight. See app/mavlink_sender.py for
+        # the collision-avoidance scheme (per-metric component_id).
+        self._mav_sender = MavlinkSender() if HAS_MAVLINK_SENDER else None
+        self._mav_publish_thread = None
+        self._mav_publish_interval_s = 1.0
+        # Mostly for diagnostics: number of NVFs accepted by mavlink2rest
+        # since the publisher started, and the timestamp of the last accept.
+        self._mav_publish_count = 0
+        self._mav_publish_last_ok_ts = None
         
         # Aggregated sensor data for dashboard display
         self.sensor_data = {
@@ -236,8 +262,12 @@ class NMEAHandler:
             }
         }
         
-        # Historical sensor data for sparklines (15 minutes = 900 seconds)
+        # Historical sensor data for sparklines (15 minutes = 900 seconds).
+        # Samples are capped at ~1 Hz per series so a full payload stays small
+        # even when NMEA arrives at 5–10 Hz.
         self.history_duration = 900  # seconds
+        self.history_min_interval = 1.0  # seconds between samples per key
+        self._history_last_record = {}  # key -> monotonic/time of last append
         self.sensor_history = {
             'wind_apparent_speed': [],
             'wind_apparent_angle': [],
@@ -295,6 +325,25 @@ class NMEAHandler:
         # Auto-connect in background so the web UI is always reachable
         t = threading.Thread(target=self._auto_connect, daemon=True, name='serial-auto')
         t.start()
+
+        # 1 Hz NAMED_VALUE_FLOAT publisher (wind values into the autopilot
+        # .BIN log via mavlink2rest). Independent of the UDP NMEA stream.
+        if self._mav_sender is not None:
+            self._mav_publish_thread = threading.Thread(
+                target=self._mav_publish_loop,
+                daemon=True,
+                name='mav-nvf-publisher',
+            )
+            self._mav_publish_thread.start()
+            try:
+                planned = self._mav_sender.planned_component_ids()
+                self.app_logger.info(
+                    "mavlink2rest NVF publisher started at %.1f Hz; "
+                    "system_id=255, component_ids=%s",
+                    1.0 / self._mav_publish_interval_s, planned,
+                )
+            except Exception:
+                pass
 
     def load_state(self):
         """Load saved state from file"""
@@ -540,6 +589,7 @@ class NMEAHandler:
                 'messages_received': self.messages_received,
                 'serial_health': self.get_serial_health(),
                 'observed_sentence_last_seen': self.sentence_last_seen,
+                'mavlink_nvf': self.get_mavlink_nvf_status(),
                 'now': now,
                 'connected_since': self.connected_since,
             })
@@ -859,25 +909,33 @@ class NMEAHandler:
             pass
 
     def _record_history(self, key, value):
-        """Record a value to the history buffer for sparklines."""
+        """Record a value to the history buffer for sparklines (~1 Hz max)."""
         if value is None:
             return
-        
+
         now = time.time()
+        last = self._history_last_record.get(key)
+        if last is not None and (now - last) < self.history_min_interval:
+            return
+        self._history_last_record[key] = now
         self.sensor_history[key].append({'t': now, 'v': value})
-        
+
         # Prune old entries (older than 15 minutes)
         cutoff = now - self.history_duration
         self.sensor_history[key] = [
-            entry for entry in self.sensor_history[key] 
+            entry for entry in self.sensor_history[key]
             if entry['t'] >= cutoff
         ]
 
     def _record_wind_paired_samples(self, buffer_key, speed, angle):
-        """Append one timestamped sample for wind rose / heatmap (speed and angle both required)."""
+        """Append one timestamped sample for wind rose / heatmap (~1 Hz max)."""
         if speed is None or angle is None:
             return
         now = time.time()
+        last = self._history_last_record.get(buffer_key)
+        if last is not None and (now - last) < self.history_min_interval:
+            return
+        self._history_last_record[buffer_key] = now
         self.sensor_history[buffer_key].append({
             't': now,
             'speed': float(speed),
@@ -889,12 +947,21 @@ class NMEAHandler:
             if e['t'] >= cutoff
         ]
 
-    def get_sensor_history(self):
-        """Return the sensor history for sparklines."""
-        # Return history with relative timestamps (seconds ago)
+    def get_sensor_history(self, keys=None):
+        """Return sensor history for sparklines.
+
+        If ``keys`` is a non-empty iterable of series names, only those series
+        are included (plus ``history_window_seconds``). Unknown keys are ignored.
+        """
         now = time.time()
+        if keys:
+            selected = [k for k in keys if k in self.sensor_history]
+        else:
+            selected = list(self.sensor_history.keys())
+
         result = {}
-        for key, entries in self.sensor_history.items():
+        for key in selected:
+            entries = self.sensor_history[key]
             if key in ('wind_apparent_paired', 'wind_true_paired'):
                 result[key] = [
                     {
@@ -916,8 +983,10 @@ class NMEAHandler:
         """Clear paired samples used for wind roses / heatmaps (``apparent`` or ``true``)."""
         if which == 'apparent':
             self.sensor_history['wind_apparent_paired'] = []
+            self._history_last_record.pop('wind_apparent_paired', None)
         elif which == 'true':
             self.sensor_history['wind_true_paired'] = []
+            self._history_last_record.pop('wind_true_paired', None)
 
     def _parse_nmea_coord(self, coord_str, direction):
         """Convert NMEA coordinate (DDMM.MMMM) to decimal degrees."""
@@ -976,6 +1045,105 @@ class NMEAHandler:
         except Exception as e:
             self.app_logger.error(f"Error stopping UDP stream: {e}")
             return False, str(e)
+
+    def get_mavlink_nvf_status(self):
+        """Diagnostics for the NAMED_VALUE_FLOAT publisher, for the UI / SSE."""
+        if not HAS_MAVLINK_SENDER or self._mav_sender is None:
+            return {'enabled': False}
+        return {
+            'enabled': True,
+            'interval_s': self._mav_publish_interval_s,
+            'planned_component_ids': self._mav_sender.planned_component_ids(),
+            'names': sorted(_MAV_NVF_OFFSETS.keys()),
+            'count_sent': self._mav_publish_count,
+            'last_ok_ts': self._mav_publish_last_ok_ts,
+        }
+
+    # ── mavlink2rest NAMED_VALUE_FLOAT publisher ─────────────────────
+    #
+    # Periodic background thread that lifts the latest parsed apparent / true
+    # wind values out of `self.sensor_data` and POSTs them to mavlink2rest as
+    # NAMED_VALUE_FLOAT messages. The autopilot logs every NVF it receives as
+    # an `NVF` row in the DataFlash .BIN log (`WX_AppSpd`, `WX_AppDir`,
+    # `WX_TruSpd`, `WX_TruDir`), which is what makes them line up against
+    # GPS / ATT / WIND post-flight.
+    #
+    # Names are deliberately distinct from ArduPilot's own `AppWndSpd` /
+    # `AppWndDir` NVFs (emitted by `AP_WindVane::send_wind()` whenever
+    # wind-vane is enabled). Co-existing streams let us tell, post-flight,
+    # whether the wind-vane subsystem ever saw the $WIMWV that this extension
+    # was sending over UDP NMEA -- if `WX_AppSpd` is healthy but `AppWndSpd`
+    # stays at 0, `WNDVN_TYPE` / `WNDVN_SPEED_TYPE` or the UDP NMEA route is
+    # misconfigured on the autopilot side.
+    #
+    # The freshness check below guarantees we never replicate the
+    # Downloads/00000230.BIN "32k zero rows" pattern: a value is only POSTed
+    # when its parse timestamp is within DEFAULT_FRESH_S of now. Missing or
+    # stale data is dropped silently.
+
+    def _wind_nvf_snapshot(self):
+        """Return {name: value} for fresh wind NVFs; never returns 0-as-stale."""
+        if not HAS_MAVLINK_SENDER:
+            return {}
+        now = time.time()
+        fresh = _MAV_DEFAULT_FRESH_S
+        out = {}
+
+        def _take(section_key, value_key, nvf_name):
+            """Pull `value_key` from sensor_data[section_key] iff it is fresh."""
+            section = self.sensor_data.get(section_key) or {}
+            value = section.get(value_key)
+            if value is None:
+                return
+            iso_ts = section.get('timestamp')
+            if not iso_ts:
+                return
+            try:
+                # `timestamp` is a naive ISO string written via
+                # datetime.now().isoformat(); compare back in epoch seconds.
+                dt = datetime.datetime.fromisoformat(iso_ts)
+                age = now - dt.timestamp()
+            except Exception:
+                return
+            if age > fresh:
+                return
+            out[nvf_name] = value
+
+        # Apparent wind: angle is bow-relative (0..360), speed in knots.
+        # Source: $WIMWV with R/Relative reference.
+        _take('wind_apparent', 'angle', 'WX_AppDir')
+        _take('wind_apparent', 'speed_kts', 'WX_AppSpd')
+
+        # True wind: prefer `direction_true` (north-referenced, $WIMWD); fall
+        # back to the bow-relative `angle` field if only $WIMWV-T is being
+        # emitted. Speed in knots either way.
+        true_section = self.sensor_data.get('wind_true') or {}
+        if true_section.get('direction_true') is not None:
+            _take('wind_true', 'direction_true', 'WX_TruDir')
+        else:
+            _take('wind_true', 'angle', 'WX_TruDir')
+        _take('wind_true', 'speed_kts', 'WX_TruSpd')
+
+        return out
+
+    def _mav_publish_loop(self):
+        """1 Hz NVF publisher. Never raises out of the thread."""
+        # Stagger the first publish off the rest of the boot sequence so the
+        # auto-connect, websocket server, and waitress all settle first.
+        time.sleep(2.0)
+        while not self.should_stop:
+            try:
+                values = self._wind_nvf_snapshot()
+                if values and self._mav_sender is not None:
+                    sent = self._mav_sender.send_named_value_floats(values)
+                    if sent:
+                        self._mav_publish_count += sent
+                        self._mav_publish_last_ok_ts = time.time()
+            except Exception as e:
+                # Belt-and-braces: a bug in this loop must never take down
+                # the rest of the extension.
+                self.app_logger.error("mavlink2rest publisher error: %s", e)
+            time.sleep(self._mav_publish_interval_s)
 
     def stream_message(self, message, msg_type):
         """Stream NMEA message via UDP to autopilot"""
@@ -2025,6 +2193,7 @@ def sse_events():
                     'messages_received': nmea_handler.messages_received,
                     'serial_health': nmea_handler.get_serial_health(),
                     'observed_sentence_last_seen': nmea_handler.sentence_last_seen,
+                    'mavlink_nvf': nmea_handler.get_mavlink_nvf_status(),
                     'now': time.time(),
                     'connected_since': nmea_handler.connected_since,
                 },
@@ -2166,8 +2335,15 @@ def get_sensor_state():
 
 @app.route('/api/sensor/history', methods=['GET'])
 def get_sensor_history():
-    """Get historical sensor data for sparklines (15 min)"""
-    return jsonify(nmea_handler.get_sensor_history())
+    """Get historical sensor data for sparklines (15 min).
+
+    Optional query param ``keys``: comma-separated series names to include
+    (e.g. ``?keys=wind_apparent_paired,wind_true_paired``). When omitted,
+    all series are returned. ``history_window_seconds`` is always included.
+    """
+    keys_param = request.args.get('keys', '').strip()
+    keys = [k.strip() for k in keys_param.split(',') if k.strip()] if keys_param else None
+    return jsonify(nmea_handler.get_sensor_history(keys=keys))
 
 
 @app.route('/api/sensor/history/reset-wind-paired', methods=['POST'])
@@ -2444,6 +2620,17 @@ def set_autopilot_mode():
     sentences = nmea_handler.AUTOPILOT_MODES[mode]
     nmea_handler.app_logger.info("Autopilot UDP mode changed to '%s' — sentences: %s", mode, ', '.join(sorted(sentences)))
     return jsonify({"success": True, "mode": mode, "sentences": sorted(sentences)})
+
+@app.route('/api/mavlink/nvf_status', methods=['GET'])
+def mavlink_nvf_status():
+    """Diagnostics for the NAMED_VALUE_FLOAT publisher.
+
+    Useful when the user wants to confirm WX_AppSpd / WX_AppDir / WX_TruSpd /
+    WX_TruDir are being POSTed to mavlink2rest and accepted (which is what
+    makes them appear in the autopilot's .BIN log as `NVF` rows, alongside
+    ArduPilot's own AppWndSpd / AppWndDir wind-vane emissions).
+    """
+    return jsonify(nmea_handler.get_mavlink_nvf_status())
 
 @app.route('/api/serial/change_baud', methods=['POST'])
 def change_baud():

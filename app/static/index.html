@@ -1828,12 +1828,6 @@
               <!-- Logs Tab -->
               <v-tab-item>
                 <v-card-text>
-                  <v-alert type="info" dense class="mb-4">
-                    <v-icon left>mdi-folder</v-icon>
-                    Log directory: <code>/app/logs/</code>
-                    <div class="text-caption mt-1">Access via BlueOS File Browser at Extensions > File Browser</div>
-                  </v-alert>
-                  
                   <v-row>
                     <v-col cols="12" md="6">
                       <v-card outlined>
@@ -2243,10 +2237,13 @@
           },
           deep: true
         },
-        // Refresh logs info when switching to Logs tab
+        // Refresh logs info when switching to Logs tab; load history on Dashboard
         activeTab(newVal) {
           if (newVal === 4) {  // Logs tab index
             this.fetchLogsInfo();
+          }
+          if (newVal === 1) {  // Dashboard — sparklines / wind roses need history
+            this.fetchSensorHistory();
           }
         }
       },
@@ -3336,7 +3333,10 @@
               this.checkStreamingStatus();
               this.fetchSensorData();
             }
-            this.fetchSensorHistory();
+            // History is only needed for Dashboard sparklines / wind roses
+            if (this.activeTab === 1) {
+              this.fetchSensorHistory();
+            }
           }, 1000);
         },
         stopPolling() {
