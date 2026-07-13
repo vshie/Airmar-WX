@@ -2238,7 +2238,7 @@ def register_service():
         "description": "Airmar 300WX WeatherStation interface for BlueOS",
         "icon": "mdi-weather-windy",
         "company": "Blue Robotics",
-        "version": "0.1.0",
+        "version": "1.0.1",
         "webpage": "https://github.com/vshie/Airmar-WX",
         "api": "https://github.com/vshie/Airmar-WX"
     })
@@ -2250,7 +2250,7 @@ def docs():
         "openapi": "3.0.0",
         "info": {
             "title": "Airmar 300WX API",
-            "version": "0.1",
+            "version": "1.0.1",
             "description": "API for Airmar 300WX WeatherStation"
         },
         "paths": {
