@@ -62,7 +62,7 @@ EXPOSE 8765
 
 # BlueOS extension metadata
 LABEL org.blueos.type="tool"
-LABEL org.blueos.version="1.0.1"
+LABEL org.blueos.version="1.1.1"
 LABEL org.blueos.requirements="core >= 1.1"
 LABEL org.blueos.name="Airmar WX"
 LABEL org.blueos.description="Interface for Airmar WX-series WeatherStations (300WX, 200WX) over NMEA 0183 — live dashboard, ArduPilot UDP, and Cockpit WebSocket output."
@@ -94,7 +94,7 @@ LABEL permissions='\
 # (authors, company, type, readme, links, requirements). Keeping the
 # org.blueos.* duplicates above for backward compatibility with anything
 # that may still expect them.
-LABEL version="1.0.1"
+LABEL version="1.1.1"
 LABEL type="tool"
 LABEL requirements="core >= 1.1"
 

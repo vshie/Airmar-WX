@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "airmar-wx"
-version = "1.0.1"
+version = "1.1.1"
 description = "BlueOS extension for Airmar WX-series WeatherStations (200WX, 300WX, etc.) over NMEA 0183"
 authors = [
     {name = "Tony White", email = "tony.white@bluerobotics.com"}

@@ -610,19 +610,26 @@
                     </div>
                   </v-alert>
                   
-                  <!-- Streaming Status -->
+                  <!-- Streaming Status (dual UDP routes) -->
                   <v-alert
                     v-if="isStreaming"
                     type="info"
                     dense
                     class="connection-status mt-2"
                   >
-                    <div class="d-flex align-center">
-                      <v-icon class="mr-2">mdi-broadcast</v-icon>
+                    <div class="d-flex align-start">
+                      <v-icon class="mr-2 mt-1">mdi-broadcast</v-icon>
                       <div>
                         <strong>Streaming to ArduPilot</strong>
-                        <span class="ml-2 text-caption">({{ autopilotMode === 'windvane' ? 'Wind Vane' : 'GPS + Heading' }})</span>
-                        <div>UDP {{ streamingStatus.streaming_to }} &mdash; sent {{ streamingStatus.streamed_messages }} of {{ streamingStatus.messages_received }} received</div>
+                        <div class="text-caption mt-1">
+                          Received {{ streamingStatus.messages_received }} NMEA sentences since connect.
+                        </div>
+                        <div v-for="route in (streamingStatus.routes || [])" :key="route.name" class="text-caption">
+                          <span class="text-capitalize">{{ route.name }}</span>
+                          <code class="ml-1">{{ route.endpoint }}</code>
+                          &mdash; {{ (route.sentences || []).join(', ') }}
+                          &mdash; sent <strong>{{ route.streamed_messages }}</strong>
+                        </div>
                       </div>
                     </div>
                   </v-alert>
@@ -721,283 +728,228 @@
               <!-- Setup Tab -->
               <v-tab-item>
                 <v-card-text>
-                  <div style="max-width:800px">
+                  <div style="max-width:900px">
 
-                    <h2 class="text-h5 mb-4">
-                      <v-icon left color="primary">mdi-weather-windy</v-icon>
-                      Airmar 300WX WeatherStation Setup
-                    </h2>
-
-                    <p class="body-1 mb-6">
-                      This extension connects to an Airmar 300WX WeatherStation via NMEA 0183 serial,
-                      reads wind, heading, atmosphere, and GPS data, and streams it to BlueOS and Cockpit.
-                    </p>
-
-                    <!-- Step 1: Hardware Wiring -->
+                    <!-- Step 1: wire the sensor. Image-only per user request. -->
                     <v-card outlined class="mb-4">
                       <v-card-title class="text-subtitle-1">
                         <v-chip small color="primary" class="mr-2" text-color="white">1</v-chip>
-                        Wire the Sensor to a USB-to-RS232 Adapter
+                        Wire the Airmar 300WX
                       </v-card-title>
-                      <v-card-text>
-                        <p class="body-2 mb-3">
-                          The Airmar 300WX has four wires. You need a USB-to-RS232 serial adapter
-                          and access to the BlueBoat fuse board for power.
-                        </p>
-
-                        <div class="text-overline mb-2">Power</div>
-                        <v-simple-table dense class="mb-3">
-                          <thead>
-                            <tr>
-                              <th>Airmar 300WX Wire</th>
-                              <th></th>
-                              <th>Destination</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <tr>
-                              <td><strong style="color:#e53935">Red (Power +)</strong></td>
-                              <td style="text-align:center">&rarr;</td>
-                              <td>Fuse board <strong>V1</strong> (battery voltage) screw terminal channel.
-                                  Install an appropriately rated MINI blade fuse.</td>
-                            </tr>
-                            <tr>
-                              <td><strong style="color:#9e9e9e">Black (Ground)</strong></td>
-                              <td style="text-align:center">&rarr;</td>
-                              <td>Snap-wire splice &rarr; <strong>Battery Ground</strong>
-                                  <em>and</em> adapter Black (see below)</td>
-                            </tr>
-                          </tbody>
-                        </v-simple-table>
-                        <v-alert type="info" dense text class="mb-4">
-                          The 300WX requires 9&ndash;40 V DC. On a BlueBoat with 4S batteries,
-                          the V1 rail provides ~12&ndash;16.8 V. See the
-                          <a href="https://bluerobotics.com/learn/blueboat-general-integration-guide/#connecting-to-power"
-                             target="_blank" style="color:#1976d2">BlueBoat Integration Guide &mdash; Connecting to Power</a>
-                          for fuse board details.
-                        </v-alert>
-
-                        <div class="text-overline mb-2">Data (NMEA 0183)</div>
-                        <v-simple-table dense class="mb-3">
-                          <thead>
-                            <tr>
-                              <th>Airmar 300WX Wire</th>
-                              <th></th>
-                              <th>USB-to-RS232 Adapter Wire</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <tr>
-                              <td><strong style="color:#f9a825">Yellow (TX+)</strong></td>
-                              <td style="text-align:center">&rarr;</td>
-                              <td><strong style="color:#eeeeee;background:#555;padding:1px 4px;border-radius:2px">White (RX)</strong> on adapter</td>
-                            </tr>
-                            <tr>
-                              <td><strong style="color:#eeeeee;background:#555;padding:1px 4px;border-radius:2px">White (TX&minus;)</strong></td>
-                              <td style="text-align:center">&rarr;</td>
-                              <td><strong style="color:#f9a825">Yellow (TX)</strong> on adapter</td>
-                            </tr>
-                          </tbody>
-                        </v-simple-table>
-
-                        <v-alert type="warning" dense text class="mb-3">
-                          <strong>Ground:</strong> Use a snap-wire splice connector to join three wires
-                          at the ground point &mdash; the Airmar <strong>black</strong> wire, the adapter
-                          <strong>black</strong> wire, and a wire to <strong>battery ground</strong>.
-                          A shared ground reference is essential for a clean signal.
-                        </v-alert>
-
-                        <p class="body-2 mb-0">
-                          Plug the USB end of the adapter into the vehicle computer (Raspberry Pi, Navigator, etc.)
-                          and proceed to step 2.
-                        </p>
+                      <v-card-text class="text-center pa-2">
+                        <img
+                          src="/static/images/airmar-wiring.jpg"
+                          alt="Airmar 300WX wiring to USB-to-RS232 adapter and BlueBoat power block"
+                          style="max-width:100%;height:auto;border-radius:4px;"
+                        >
                       </v-card-text>
                     </v-card>
 
-                    <!-- Step 2: Software Connect -->
+                    <!-- Step 2: hand-off to the autopilot. This is where the
+                         BlueOS serial-port screenshot, copyable UDPIN strings,
+                         and the ArduRover parameter apply/check/restore
+                         controls live. Everything used to live in the
+                         Sentences tab; it now belongs with the setup steps.
+                    -->
                     <v-card outlined class="mb-4">
                       <v-card-title class="text-subtitle-1">
                         <v-chip small color="primary" class="mr-2" text-color="white">2</v-chip>
-                        Connect in the Extension
+                        Configure ArduRover to receive the two NMEA streams
                       </v-card-title>
                       <v-card-text>
-                        <ol class="body-2" style="padding-left:20px;line-height:1.8">
-                          <li>In the <strong>Connection</strong> panel above, click the refresh button
-                              and select the serial port from the dropdown (or pick it from
-                              <em>Device Identification</em>).</li>
-                          <li>Click <strong>Connect</strong>. The extension will auto-negotiate
-                              115200 baud for maximum bandwidth.</li>
-                          <li>Once connected, the <strong>Dashboard</strong> tab shows live sensor data.</li>
-                        </ol>
-                        <v-alert type="info" dense text class="mt-3 mb-0">
-                          <strong>Tip:</strong> The extension remembers the last port and reconnects
-                          automatically on restart.
+
+                        <!-- 2a: BlueOS serial-port mapping (manual). -->
+                        <div class="text-overline mb-2">2a &mdash; BlueOS Autopilot Firmware &rarr; Serial port configuration</div>
+                        <div class="text-caption grey--text mb-3">
+                          Pick two unused SERIAL slots and paste one <code>udpin</code>
+                          string into each. Then click <strong>Save and Restart</strong>.
+                          Note which SERIAL numbers you use &mdash; you enter the same
+                          numbers in step&nbsp;2b.
+                        </div>
+                        <div class="d-flex flex-wrap align-center mb-3" style="gap: 12px;">
+                          <div class="d-flex align-center" style="gap: 6px;">
+                            <span class="text-caption font-weight-medium">Wind:</span>
+                            <code>{{ udpinWindString }}</code>
+                            <v-btn x-small text @click="copyToClipboard(udpinWindString, 'wind')">
+                              <v-icon x-small left>mdi-content-copy</v-icon>
+                              {{ udpinCopied === 'wind' ? 'Copied' : 'Copy' }}
+                            </v-btn>
+                          </div>
+                          <div class="d-flex align-center" style="gap: 6px;">
+                            <span class="text-caption font-weight-medium">GPS + heading:</span>
+                            <code>{{ udpinGpsString }}</code>
+                            <v-btn x-small text @click="copyToClipboard(udpinGpsString, 'gps')">
+                              <v-icon x-small left>mdi-content-copy</v-icon>
+                              {{ udpinCopied === 'gps' ? 'Copied' : 'Copy' }}
+                            </v-btn>
+                          </div>
+                        </div>
+                        <div class="text-center mb-4">
+                          <img
+                            :src="autopilotSetupScreenshotSrc"
+                            @error="autopilotScreenshotBroken = true"
+                            v-show="!autopilotScreenshotBroken"
+                            alt="BlueOS Autopilot Firmware serial port configuration with two udpin entries"
+                            style="max-width:100%;height:auto;border:1px solid rgba(0,0,0,0.15);border-radius:4px;"
+                          >
+                          <div v-if="autopilotScreenshotBroken" class="text-caption grey--text">
+                            (Screenshot not present. Paste the two <code>udpin</code>
+                            strings above into two unused serial slots in BlueOS
+                            Autopilot Firmware, then Save and Restart.)
+                          </div>
+                        </div>
+
+                        <v-divider class="mb-3"></v-divider>
+
+                        <!-- 2b: extension applies the ArduPilot parameters. -->
+                        <div class="text-overline mb-2">2b &mdash; Apply ArduRover parameters</div>
+                        <div class="text-caption grey--text mb-3">
+                          Enter the SERIAL numbers you used in step&nbsp;2a. Clicking
+                          Apply writes and verifies the matching ArduPilot parameters
+                          via mavlink2rest. If they drift later, this panel offers
+                          Restore or Ignore.
+                        </div>
+
+                        <v-row dense>
+                          <v-col cols="12" md="6">
+                            <div class="text-caption font-weight-medium mb-1">Wind serial (SERIAL X)</div>
+                            <v-select
+                              v-model="autopilotSetupForm.wind_serial"
+                              :items="serialIndexOptions"
+                              :disabled="autopilotBusy"
+                              dense
+                              outlined
+                              hide-details
+                            ></v-select>
+                          </v-col>
+                          <v-col cols="12" md="6">
+                            <div class="text-caption font-weight-medium mb-1">GPS + heading serial (SERIAL Y)</div>
+                            <v-select
+                              v-model="autopilotSetupForm.gps_serial"
+                              :items="serialIndexOptions"
+                              :disabled="autopilotBusy"
+                              dense
+                              outlined
+                              hide-details
+                            ></v-select>
+                          </v-col>
+                        </v-row>
+
+                        <v-checkbox
+                          v-model="autopilotSetupForm.use_gps_yaw_fallback"
+                          :disabled="autopilotBusy"
+                          dense
+                          hide-details
+                          class="mt-3"
+                          label="Also use Airmar heading as primary yaw with compass fallback (sets EK3_SRC1_YAW=3)"
+                        ></v-checkbox>
+                        <div class="text-caption grey--text mt-1">
+                          Off by default. Airmar HDT is a magnetometer-derived heading
+                          (not dual-antenna GPS yaw), so leave this off unless the
+                          on-board compass is worse than the Airmar heading.
+                        </div>
+
+                        <v-alert
+                          v-if="autopilotSetupSameSerialError"
+                          type="warning"
+                          dense
+                          text
+                          class="mt-3 mb-0"
+                        >
+                          Wind and GPS must use different SERIAL ports.
+                        </v-alert>
+
+                        <div class="d-flex flex-wrap align-center mt-3" style="gap: 8px;">
+                          <v-btn
+                            color="primary"
+                            :loading="autopilotBusy"
+                            :disabled="!autopilotSetupFormValid"
+                            @click="applyAutopilotSetup"
+                          >
+                            <v-icon left>mdi-content-save-cog</v-icon>
+                            {{ autopilotSetup.applied ? 'Re-apply' : 'Apply parameters' }}
+                          </v-btn>
+                          <v-btn
+                            text
+                            :disabled="autopilotBusy || !autopilotSetup.applied"
+                            @click="checkAutopilotSetup"
+                          >
+                            <v-icon left>mdi-refresh</v-icon>
+                            Check
+                          </v-btn>
+                        </div>
+
+                        <v-alert
+                          v-if="autopilotDriftBannerVisible"
+                          type="warning"
+                          outlined
+                          dense
+                          class="mt-4 mb-0"
+                        >
+                          <div class="d-flex align-start flex-wrap" style="gap: 8px;">
+                            <div>
+                              <strong>ArduRover parameters have drifted from the applied setup.</strong>
+                              <ul class="mt-1 mb-1" style="padding-left: 18px;">
+                                <li v-for="d in autopilotSetup.drift" :key="d.param" class="text-caption">
+                                  <code>{{ d.param }}</code>:
+                                  expected <strong>{{ d.expected }}</strong>,
+                                  current
+                                  <strong v-if="d.available">{{ d.current }}</strong>
+                                  <em v-else>unavailable</em>
+                                </li>
+                              </ul>
+                            </div>
+                            <v-spacer></v-spacer>
+                            <div class="d-flex align-center" style="gap: 6px;">
+                              <v-btn small color="primary" :loading="autopilotBusy" @click="restoreAutopilotSetup">
+                                Restore
+                              </v-btn>
+                              <v-btn small text :disabled="autopilotBusy" @click="ignoreAutopilotDrift">
+                                Ignore
+                              </v-btn>
+                            </div>
+                          </div>
+                        </v-alert>
+
+                        <v-alert
+                          v-if="autopilotSetupMessage"
+                          :type="autopilotSetupOk ? 'success' : 'error'"
+                          dense
+                          text
+                          dismissible
+                          class="mt-3 mb-0"
+                          @input="autopilotSetupMessage = ''"
+                        >
+                          {{ autopilotSetupMessage }}
                         </v-alert>
                       </v-card-text>
                     </v-card>
 
-                    <!-- Step 3 -->
-                    <v-card outlined class="mb-4">
-                      <v-card-title class="text-subtitle-1">
-                        <v-chip small color="primary" class="mr-2" text-color="white">3</v-chip>
-                        Display Data in Cockpit
-                      </v-card-title>
-                      <v-card-text>
-                        <p class="body-2 mb-3">
-                          The extension streams wind, GPS, and heading data to Cockpit's data-lake
-                          over WebSocket. To set it up:
-                        </p>
-                        <ol class="body-2" style="padding-left:20px;line-height:1.8">
-                          <li>In Cockpit, open <strong>Menu &gt; Settings &gt; General</strong>.</li>
-                          <li>Scroll to <strong>Generic WebSocket connections</strong>.</li>
-                          <li>Add the URL:
-                            <code style="background:#f5f5f5;padding:2px 6px;border-radius:3px">ws://{{ connectionInfo.connected ? 'vehicle-address' : 'vehicle-address' }}:8765</code>
-                          </li>
-                          <li>Click the <strong>+</strong> button to save the connection.</li>
-                        </ol>
-                        <p class="body-2 mt-3 mb-2">
-                          Once connected, the following variables appear in Cockpit's data-lake:
-                        </p>
-                        <v-simple-table dense class="mb-3">
-                          <thead>
-                            <tr>
-                              <th>Variable</th>
-                              <th>Description</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <tr>
-                              <td><code>wind-direction-true</code></td>
-                              <td>Wind direction relative to north (degrees)</td>
-                            </tr>
-                            <tr>
-                              <td><code>wind-speed-kts</code></td>
-                              <td>Wind speed (knots)</td>
-                            </tr>
-                            <tr>
-                              <td><code>heading-true</code></td>
-                              <td>True heading from compass (degrees)</td>
-                            </tr>
-                            <tr>
-                              <td><code>gps-latitude</code></td>
-                              <td>GPS latitude (decimal degrees)</td>
-                            </tr>
-                            <tr>
-                              <td><code>gps-longitude</code></td>
-                              <td>GPS longitude (decimal degrees)</td>
-                            </tr>
-                            <tr>
-                              <td><code>gps-altitude-m</code></td>
-                              <td>GPS altitude (metres)</td>
-                            </tr>
-                            <tr>
-                              <td><code>gps-satellites</code></td>
-                              <td>Number of GPS satellites in use</td>
-                            </tr>
-                            <tr>
-                              <td><code>gps-fix-quality</code></td>
-                              <td>GPS fix quality (0=none, 1=GPS, 2=DGPS)</td>
-                            </tr>
-                            <tr>
-                              <td><code>gps-course-true</code></td>
-                              <td>Course over ground (degrees true)</td>
-                            </tr>
-                            <tr>
-                              <td><code>gps-speed-kts</code></td>
-                              <td>Speed over ground (knots)</td>
-                            </tr>
-                          </tbody>
-                        </v-simple-table>
-                        <p class="body-2 mb-0">
-                          All variables are streamed regardless of the ArduPilot UDP mode.
-                          They can be assigned to any Cockpit widget, mini-widget, or HUD overlay.
-                        </p>
-                      </v-card-text>
-                    </v-card>
-
-                    <!-- Step 4 -->
-                    <v-card outlined class="mb-4">
-                      <v-card-title class="text-subtitle-1">
-                        <v-chip small color="primary" class="mr-2" text-color="white">4</v-chip>
-                        Build a Custom Wind Widget
-                      </v-card-title>
-                      <v-card-text>
-                        <v-alert type="info" dense text class="mb-0">
-                          <strong>Coming soon</strong> — Instructions for building a DIY Cockpit widget
-                          that graphs live wind speed and direction from the WeatherStation data-lake variables.
-                        </v-alert>
-                      </v-card-text>
-                    </v-card>
-
-                    <!-- Step 5 -->
-                    <v-card outlined class="mb-4">
-                      <v-card-title class="text-subtitle-1">
-                        <v-chip small color="primary" class="mr-2" text-color="white">5</v-chip>
-                        Configure NMEA Sentences
-                      </v-card-title>
-                      <v-card-text>
-                        <p class="body-2 mb-0">
-                          Use the <strong>Sentences</strong> tab to enable or disable individual
-                          NMEA sentence types and adjust their transmission rates.
-                          The bandwidth indicator shows how much serial capacity is in use at the
-                          current baud rate.
-                        </p>
-                      </v-card-text>
-                    </v-card>
-
-                    <!-- Advanced serial: force 4800 baud -->
-                    <v-card outlined class="mb-4">
+                    <!-- Advanced serial: force 4800 baud (kept, hidden until
+                         connected at 115200 so it doesn't clutter the flow). -->
+                    <v-card
+                      outlined
+                      class="mb-2"
+                      v-if="connectionInfo.connected && connectionInfo.baud_rate === 115200"
+                    >
                       <v-card-title class="text-subtitle-1">
                         <v-icon left small>mdi-speedometer-slow</v-icon>
                         Serial baud rate (advanced)
                       </v-card-title>
                       <v-card-text>
                         <p class="body-2 mb-3">
-                          If the link is at 115200 baud but you need standard 4800 NMEA (for example for another listener),
-                          you can command the WeatherStation to 4800 baud and reopen the port.
-                          This also saves 4800 as the device default (same as a manual baud change).
+                          Force the WeatherStation back to standard 4800 NMEA and
+                          save that as the device default. Only offered while
+                          connected at 115200.
                         </p>
                         <v-btn
-                          v-if="connectionInfo.connected && connectionInfo.baud_rate === 115200"
                           color="secondary"
                           @click="forceDeviceTo4800"
-                          class="mr-2 mb-2"
                           title="Send $PAMTC,BAUD,4800*… and reopen at 4800"
                         >
                           <v-icon left>mdi-numeric</v-icon>
                           Force device to 4800 baud
                         </v-btn>
-                        <p v-else-if="connectionInfo.connected" class="body-2 grey--text mb-0">
-                          Current link is already at {{ connectionInfo.baud_rate }} baud — forcing 4800 is only offered at 115200.
-                        </p>
-                        <p v-else class="body-2 grey--text mb-0">
-                          Connect to the WeatherStation above to use this option.
-                        </p>
-                      </v-card-text>
-                    </v-card>
-
-                    <!-- Help -->
-                    <v-card outlined class="mb-2">
-                      <v-card-title class="text-subtitle-1">
-                        <v-icon left small>mdi-help-circle-outline</v-icon>
-                        Troubleshooting
-                      </v-card-title>
-                      <v-card-text>
-                        <ul class="body-2" style="padding-left:20px;line-height:1.8">
-                          <li><strong>No serial port listed?</strong>
-                              Check that the USB cable is connected and the adapter driver is loaded.
-                              Click the refresh button to rescan.</li>
-                          <li><strong>Garbled data?</strong>
-                              The extension auto-switches to 115200 baud. If the device was left in a
-                              mixed state, power-cycle the WeatherStation and reconnect.</li>
-                          <li><strong>Cockpit not showing wind data?</strong>
-                              Verify the WebSocket URL is correct and that the extension is connected
-                              to the WeatherStation (green status above).</li>
-                          <li><strong>Need to stay at 4800 baud?</strong>
-                              Check the "Stay at 4800 baud only" box before connecting, or
-                              after connecting at 115200 use <strong>Setup</strong> &rarr; <em>Serial baud rate (advanced)</em>
-                              to force the device to 4800 baud.</li>
-                        </ul>
                       </v-card-text>
                     </v-card>
 
@@ -1093,7 +1045,7 @@
                             >Clear</v-btn>
                           </v-card-title>
                           <v-card-subtitle class="text-caption px-3 grey--text">
-                            Bow‑relative apparent wind (MWV <strong>R</strong>).
+                            Bow‑relative apparent wind (MWV <strong>R</strong>): 0° = bow.
                           </v-card-subtitle>
                           <v-card-text class="py-2 wind-rose-body">
                             <div class="text-center">
@@ -1102,10 +1054,10 @@
                                 <g v-for="(sec, i) in windRoseChartApparent.sectors" :key="'rose-a-' + i">
                                   <path :d="sec.d" :fill="sec.fill" stroke="rgba(0,0,0,0.18)" stroke-width="0.65" />
                                 </g>
-                                <text x="100" y="16" text-anchor="middle">N</text>
-                                <text x="186" y="104" text-anchor="middle">E</text>
-                                <text x="100" y="194" text-anchor="middle">S</text>
-                                <text x="14" y="104" text-anchor="middle">W</text>
+                                <text x="100" y="16" text-anchor="middle">Bow</text>
+                                <text x="180" y="104" text-anchor="middle">Stbd</text>
+                                <text x="100" y="194" text-anchor="middle">Stern</text>
+                                <text x="20" y="104" text-anchor="middle">Port</text>
                               </svg>
                             </div>
                           </v-card-text>
@@ -1731,42 +1683,50 @@
                     </div>
                   </div>
 
-                  <!-- ArduPilot UDP mode selector -->
+                  <!-- ArduPilot UDP dual-route status -->
                   <v-card outlined class="mb-4" v-if="connectionInfo.connected">
                     <v-card-text class="pb-2 pt-3">
-                      <div class="text-overline mb-2">ArduPilot UDP Stream (port 27000)</div>
+                      <div class="text-overline mb-2">ArduPilot UDP Stream</div>
                       <div class="text-caption grey--text mb-3">
-                        Choose which data to forward to the autopilot via UDP.
-                        Wind and GPS data are always available in Cockpit via WebSocket regardless of this setting.
+                        Two filtered NMEA streams are sent to the autopilot at the same time.
+                        Wind sentences drive AP_WindVane_NMEA on one serial port; GPS + heading
+                        sentences drive AP_GPS on another. Wind and GPS data remain available
+                        in Cockpit via WebSocket regardless of streaming state.
                       </div>
-                      <v-btn-toggle
-                        :value="autopilotMode"
-                        @change="setAutopilotMode($event)"
-                        mandatory
-                        dense
-                        color="primary"
-                      >
-                        <v-btn value="windvane" small>
-                          <v-icon left small>mdi-weather-windy</v-icon>
-                          Wind Vane
-                        </v-btn>
-                        <v-btn value="gps" small>
-                          <v-icon left small>mdi-satellite-variant</v-icon>
-                          GPS + Heading
-                        </v-btn>
-                      </v-btn-toggle>
-                      <div class="text-caption mt-2">
-                        <template v-if="autopilotMode === 'windvane'">
-                          <v-icon x-small color="primary" class="mr-1">mdi-arrow-right</v-icon>
-                          Streaming <strong>MWV</strong> (apparent wind) — set the wind vane type to <strong>NMEA</strong> in ArduRover parameters
+                      <v-simple-table dense>
+                        <template v-slot:default>
+                          <thead>
+                            <tr>
+                              <th class="text-left">Route</th>
+                              <th class="text-left">Sentences</th>
+                              <th class="text-left">UDP endpoint</th>
+                              <th class="text-right">Sent</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr v-for="route in (streamingStatus.routes || [])" :key="route.name">
+                              <td class="text-capitalize">{{ route.name }}</td>
+                              <td>{{ (route.sentences || []).join(', ') }}</td>
+                              <td><code>{{ route.endpoint }}</code></td>
+                              <td class="text-right">{{ route.streamed_messages }}</td>
+                            </tr>
+                          </tbody>
                         </template>
-                        <template v-else>
-                          <v-icon x-small color="primary" class="mr-1">mdi-arrow-right</v-icon>
-                          Streaming <strong>GGA, RMC, VTG, HDT</strong> — configure as GPS/heading source in ArduPilot
-                        </template>
-                      </div>
+                      </v-simple-table>
                     </v-card-text>
                   </v-card>
+
+                  <!-- ArduRover parameter setup lives in the Setup tab. -->
+                  <v-alert
+                    v-if="connectionInfo.connected"
+                    type="info"
+                    dense
+                    text
+                    class="mb-4"
+                  >
+                    Configure which ArduRover serial ports receive the two UDP
+                    streams in the <strong>Setup</strong> tab (step&nbsp;2).
+                  </v-alert>
 
                   <v-simple-table dense v-if="sentences.length > 0">
                     <template v-slot:default>
@@ -1941,14 +1901,44 @@
         serialPortInfo: { serial_port: 'Not connected', baud_rate: 0 },
         pollingInterval: null,
         isStreaming: false,
-        autopilotMode: 'windvane',
+        // Dual-route UDP streaming status (wind → 27001, gps → 27002).
         streamingStatus: {
-          streaming_to: null,
+          routes: [],
           streamed_messages: 0,
+          streamed_wind_messages: 0,
+          streamed_gps_messages: 0,
           messages_received: 0,
           serial_health: null,
-          messages_per_second: null
+          messages_per_second: null,
+          autopilot_setup: null
         },
+        // ArduRover parameter setup (see /api/autopilot/setup).
+        autopilotSetup: {
+          enabled: false,
+          wind_serial: null,
+          gps_serial: null,
+          use_gps_yaw_fallback: false,
+          applied: false,
+          ignore_drift: false,
+          expected: {},
+          drift: [],
+          min_serial_index: 1,
+          max_serial_index: 9,
+          udpin_wind_string: 'udpin:0.0.0.0:27001',
+          udpin_gps_string: 'udpin:0.0.0.0:27002'
+        },
+        // Local edit state for the setup form (not applied until user clicks).
+        autopilotSetupForm: {
+          wind_serial: null,
+          gps_serial: null,
+          use_gps_yaw_fallback: false
+        },
+        autopilotBusy: false,
+        autopilotSetupMessage: '',
+        autopilotSetupOk: true,
+        autopilotScreenshotBroken: false,
+        udpinCopied: null,
+        _autopilotCheckTimer: null,
         sse: {
           connected: false,
           last_error: null
@@ -2067,6 +2057,41 @@
         }
       },
       computed: {
+        // ── ArduRover setup helpers ──────────────────────────────────
+        serialIndexOptions() {
+          const lo = this.autopilotSetup.min_serial_index || 1;
+          const hi = this.autopilotSetup.max_serial_index || 9;
+          const out = [];
+          for (let i = lo; i <= hi; i++) {
+            out.push({ text: 'SERIAL' + i, value: i });
+          }
+          return out;
+        },
+        udpinWindString() {
+          return this.autopilotSetup.udpin_wind_string || 'udpin:0.0.0.0:27001';
+        },
+        udpinGpsString() {
+          return this.autopilotSetup.udpin_gps_string || 'udpin:0.0.0.0:27002';
+        },
+        autopilotSetupSameSerialError() {
+          const a = this.autopilotSetupForm.wind_serial;
+          const b = this.autopilotSetupForm.gps_serial;
+          return a != null && b != null && a === b;
+        },
+        autopilotSetupFormValid() {
+          const a = this.autopilotSetupForm.wind_serial;
+          const b = this.autopilotSetupForm.gps_serial;
+          return !this.autopilotBusy && Number.isInteger(a) && Number.isInteger(b) && a !== b;
+        },
+        autopilotSetupScreenshotSrc() {
+          return '/static/images/blueos-serial-config.png';
+        },
+        autopilotDriftBannerVisible() {
+          return this.autopilotSetup.applied &&
+                 !this.autopilotSetup.ignore_drift &&
+                 Array.isArray(this.autopilotSetup.drift) &&
+                 this.autopilotSetup.drift.length > 0;
+        },
         parsedMessages() {
           return this.messages.map(msg => {
             const parsed = this.parseNMEA(msg.raw, msg.type);
@@ -2503,14 +2528,18 @@
             if (dt > 0.2) mps = (nextCount - prevCount) / dt;
           }
           this.streamingStatus = {
-            streaming_to: ss.streaming_to,
+            routes: Array.isArray(ss.routes) ? ss.routes : [],
             streamed_messages: ss.streamed_messages || 0,
+            streamed_wind_messages: ss.streamed_wind_messages || 0,
+            streamed_gps_messages: ss.streamed_gps_messages || 0,
             messages_received: nextCount,
             serial_health: ss.serial_health || null,
             messages_per_second: (mps !== null && isFinite(mps)) ? Math.max(0, mps) : null,
+            autopilot_setup: ss.autopilot_setup || null,
             _last_count_at: now
           };
-          if (ss.autopilot_mode) this.autopilotMode = ss.autopilot_mode;
+          if (typeof ss.is_streaming === 'boolean') this.isStreaming = ss.is_streaming;
+          if (ss.autopilot_setup) this.mergeAutopilotSetup(ss.autopilot_setup);
           // Keep sentence switches in sync using last-seen
           if (this.connectionInfo.connected && ss.observed_sentence_last_seen && this.sentences.length > 0) {
             this.reconcileSentenceSwitches(ss.observed_sentence_last_seen, ss.now, ss.connected_since);
@@ -3129,14 +3158,127 @@
           this.connectionInfo.status = 'disconnected';
           this.connectionInfo.message = 'Connection cancelled';
         },
-        async setAutopilotMode(mode) {
+        // ── ArduRover parameter setup ──────────────────────────────
+        mergeAutopilotSetup(data) {
+          if (!data || typeof data !== 'object') return;
+          const merged = Object.assign({}, this.autopilotSetup, data);
+          merged.expected = data.expected || {};
+          if (!Array.isArray(merged.drift)) merged.drift = merged.drift || [];
+          this.autopilotSetup = merged;
+          // Seed the form with the persisted selection on first load so the
+          // user sees what was applied before, not blank selects.
+          if (this.autopilotSetupForm.wind_serial == null && data.wind_serial != null) {
+            this.autopilotSetupForm.wind_serial = data.wind_serial;
+          }
+          if (this.autopilotSetupForm.gps_serial == null && data.gps_serial != null) {
+            this.autopilotSetupForm.gps_serial = data.gps_serial;
+          }
+          if (typeof data.use_gps_yaw_fallback === 'boolean' &&
+              this.autopilotSetupForm.use_gps_yaw_fallback === false) {
+            this.autopilotSetupForm.use_gps_yaw_fallback = data.use_gps_yaw_fallback;
+          }
+        },
+        async fetchAutopilotSetup() {
           try {
-            const response = await axios.post('/api/stream/autopilot_mode', { mode });
-            if (response.data.success) {
-              this.autopilotMode = response.data.mode;
+            const r = await axios.get('/api/autopilot/setup');
+            if (r.data && r.data.status) this.mergeAutopilotSetup(r.data.status);
+          } catch (e) { /* best-effort */ }
+        },
+        async applyAutopilotSetup() {
+          if (!this.autopilotSetupFormValid) return;
+          this.autopilotBusy = true;
+          this.autopilotSetupMessage = '';
+          try {
+            const r = await axios.post('/api/autopilot/setup', {
+              wind_serial: this.autopilotSetupForm.wind_serial,
+              gps_serial: this.autopilotSetupForm.gps_serial,
+              use_gps_yaw_fallback: !!this.autopilotSetupForm.use_gps_yaw_fallback
+            });
+            this.autopilotSetupOk = !!r.data.success;
+            this.autopilotSetupMessage = this.formatSetupResultMessage(r.data);
+            if (r.data && r.data.status) this.mergeAutopilotSetup(r.data.status);
+            await this.checkAutopilotSetup();
+          } catch (e) {
+            this.autopilotSetupOk = false;
+            this.autopilotSetupMessage = e.message || 'Apply failed';
+          } finally {
+            this.autopilotBusy = false;
+          }
+        },
+        async checkAutopilotSetup() {
+          try {
+            const r = await axios.get('/api/autopilot/check');
+            if (r.data && r.data.status) this.mergeAutopilotSetup(r.data.status);
+            if (r.data) {
+              this.autopilotSetup = Object.assign({}, this.autopilotSetup, {
+                drift: Array.isArray(r.data.drift) ? r.data.drift : [],
+                ignore_drift: !!r.data.ignore_drift
+              });
             }
-          } catch (error) {
-            console.error('Error setting autopilot mode:', error);
+          } catch (e) { /* best-effort */ }
+        },
+        async restoreAutopilotSetup() {
+          this.autopilotBusy = true;
+          this.autopilotSetupMessage = '';
+          try {
+            const r = await axios.post('/api/autopilot/restore');
+            this.autopilotSetupOk = !!r.data.success;
+            this.autopilotSetupMessage = this.formatSetupResultMessage(r.data);
+            if (r.data && r.data.status) this.mergeAutopilotSetup(r.data.status);
+            await this.checkAutopilotSetup();
+          } catch (e) {
+            this.autopilotSetupOk = false;
+            this.autopilotSetupMessage = e.message || 'Restore failed';
+          } finally {
+            this.autopilotBusy = false;
+          }
+        },
+        async ignoreAutopilotDrift() {
+          this.autopilotBusy = true;
+          try {
+            const r = await axios.post('/api/autopilot/ignore_drift');
+            if (r.data && r.data.status) this.mergeAutopilotSetup(r.data.status);
+            this.autopilotSetup = Object.assign({}, this.autopilotSetup, {
+              drift: [], ignore_drift: true
+            });
+          } catch (e) { /* best-effort */ }
+          finally { this.autopilotBusy = false; }
+        },
+        formatSetupResultMessage(payload) {
+          if (!payload) return '';
+          const result = payload.result || {};
+          const rows = Object.keys(result).map(k => {
+            const row = result[k] || {};
+            if (row.action === 'noop') return `${k}: already set`;
+            if (row.action === 'wrote') return `${k}: wrote ${row.target}`;
+            if (row.action === 'skipped') return `${k}: skipped (${row.reason || 'unavailable'})`;
+            if (row.action === 'failed') return `${k}: failed (${row.reason || 'unknown'})`;
+            return `${k}: ${row.action || 'unknown'}`;
+          });
+          const base = payload.message || (payload.success ? 'ok' : 'failed');
+          if (!rows.length) return base;
+          return base + ' — ' + rows.join('; ');
+        },
+        copyToClipboard(text, tag) {
+          const done = () => {
+            this.udpinCopied = tag;
+            setTimeout(() => {
+              if (this.udpinCopied === tag) this.udpinCopied = null;
+            }, 1500);
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done).catch(done);
+          } else {
+            // Fallback for older browsers / non-secure contexts.
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); } catch (e) {}
+            document.body.removeChild(ta);
+            done();
           }
         },
         async toggleStreaming() {
@@ -3165,15 +3307,8 @@
         async checkStreamingStatus() {
           try {
             const response = await axios.get('/api/stream/status');
-            this.isStreaming = response.data.is_streaming;
-            if (response.data.autopilot_mode) this.autopilotMode = response.data.autopilot_mode;
-            this.applyStreamStatus({
-              streaming_to: response.data.streaming_to,
-              autopilot_mode: response.data.autopilot_mode,
-              streamed_messages: response.data.streamed_messages || 0,
-              messages_received: response.data.messages_received ?? 0,
-              serial_health: response.data.serial_health || null
-            });
+            this.isStreaming = !!response.data.is_streaming;
+            this.applyStreamStatus(response.data);
             if (response.data.is_streaming && !this.isStreaming) {
               await this.toggleStreaming();
             }
@@ -3557,11 +3692,20 @@
         this.fetchSensorData();
         this.fetchSensorHistory();
         this.fetchLogsInfo();
+        this.fetchAutopilotSetup();
         this.startSse();
         this.freshnessTick = Date.now();
         this.freshnessInterval = setInterval(() => {
           this.freshnessTick = Date.now();
         }, 1000);
+        // Poll the autopilot for parameter drift every 30s. Cheap and covers
+        // manual param changes made outside this extension (Mission Planner,
+        // Cockpit param editor, etc).
+        this._autopilotCheckTimer = setInterval(() => {
+          if (this.autopilotSetup.applied && !this.autopilotBusy) {
+            this.checkAutopilotSetup();
+          }
+        }, 30000);
       },
       beforeDestroy() {
         this.stopSse();
@@ -3572,6 +3716,10 @@
         if (this.freshnessInterval) {
           clearInterval(this.freshnessInterval);
           this.freshnessInterval = null;
+        }
+        if (this._autopilotCheckTimer) {
+          clearInterval(this._autopilotCheckTimer);
+          this._autopilotCheckTimer = null;
         }
         this.stopPolling();
         this.stopConnectionStatusPolling();

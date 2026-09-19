@@ -11,7 +11,8 @@ A BlueOS extension for the Airmar 300WX WeatherStation. Connects via NMEA 0183 s
 - Per-sentence enable/disable and transmission interval control
 - Bandwidth usage indicator (percentage of serial bus capacity)
 - Raw message view with one card per message type and live Hz rate
-- UDP streaming to ArduPilot — selectable Wind Vane or GPS + Heading mode
+- Dual UDP streams to ArduPilot — wind on `27001` and GPS + heading on `27002`, always active while streaming is on
+- One-click ArduRover parameter setup (SERIAL X/Y, wind vane + GPS NMEA + optional GPS-yaw source) with drift detection and restore/ignore
 - Cockpit data-lake WebSocket streaming of wind, GPS, and heading data
 - Persistent NMEA message and application logs with download/delete
 
@@ -57,18 +58,49 @@ When manually installing, paste this into the **Custom settings** field:
 }
 ```
 
-## ArduPilot UDP Streaming
+## ArduPilot UDP Streaming (dual routes)
 
-The extension forwards NMEA sentences to the autopilot via UDP on port 27000. In the **Sentences** tab, choose one of two modes:
+The extension forwards NMEA sentences to the autopilot via **two** UDP ports at the same time so both the wind vane driver and the GPS/heading driver can be fed simultaneously (each ArduPilot serial has a single `SERIALx_PROTOCOL`, so one port cannot serve both drivers).
 
-| Mode | Sentences | ArduPilot Use |
+| Route | UDP port | Sentences | ArduPilot driver |
+|---|---|---|---|
+| Wind    | `27001` | `$WIMWV`                                | `AP_WindVane_NMEA` (`WNDVN_TYPE = 4`) |
+| GPS + heading | `27002` | `$GPGGA`, `$GPRMC`, `$GPVTG`, `$HCHDT` | `AP_GPS` NMEA driver (`GPS1_TYPE = 5`) |
+
+### BlueOS serial port configuration (manual)
+
+Open **BlueOS → Autopilot Firmware → Serial port configuration** and set two unused serial slots to the corresponding `udpin` device string, then Save and Restart the autopilot:
+
+- `udpin:0.0.0.0:27001` — the SERIAL port that will act as the wind vane
+- `udpin:0.0.0.0:27002` — the SERIAL port that will act as the GPS/heading source
+
+Do NOT use the same serial index for both, and do NOT overwrite the on-board GPS serial. The extension surfaces both strings with a click-to-copy button on the **Sentences** tab (next to a screenshot of the serial-config page).
+
+### ArduRover parameter setup (from the extension)
+
+In **Setup → Step 2b**, pick the two SERIAL indexes you assigned above (e.g. `SERIAL2` and `SERIAL7`) and click **Apply parameters**. The extension writes the following values via mavlink2rest, verified by a fresh `PARAM_VALUE` echo per param:
+
+| Param                        | Value | Purpose |
 |---|---|---|
-| **Wind Vane** (default) | `$WIMWV` | NMEA wind vane — set wind vane type to **NMEA** in ArduRover parameters |
-| **GPS + Heading** | `$GPGGA`, `$GPRMC`, `$GPVTG`, `$HCHDT` | External GPS & heading source |
+| `SERIAL{X}_PROTOCOL`         | `21` | Wind serial → WindVane |
+| `WNDVN_TYPE`                 | `4`  | NMEA wind vane |
+| `WNDVN_SPEED_TYPE`           | `4`  | NMEA wind speed (else speed defaults to none) |
+| `SERIAL{Y}_PROTOCOL`         | `5`  | GPS serial → GPS |
+| `GPS1_TYPE` (or `GPS_TYPE`)  | `5`  | NMEA GPS driver. Legacy `GPS_TYPE` used if `GPS1_TYPE` is absent. |
+| `EK3_SRC2_YAW`               | `2`  | Alternate EKF source set uses GPS yaw |
+| `EK3_SRC2_POSXY`             | `3`  | Alternate EKF source set uses GPS for horizontal position |
+| `EK3_SRC2_VELXY`             | `3`  | Alternate EKF source set uses GPS for horizontal velocity |
+| `EK3_SRC1_YAW` *(opt-in)*    | `3`  | Optional: promote Airmar HDT to primary yaw source with compass fallback |
 
-Only one mode can be active at a time — sending both wind and GPS data on the same port can confuse the autopilot.
+Notes:
 
-See [ArduRover Wind Vane docs](https://ardupilot.org/rover/docs/wind-vane.html) for autopilot configuration.
+- **Apply-once model.** Parameters are only written when you click Apply. A background check compares live values against the applied snapshot every 30 s; if any drift is detected, the UI offers **Restore** (re-apply) or **Ignore** (persist a per-selection "never nag again" flag). Changing the SERIAL indexes or the yaw fallback checkbox counts as a new setup and clears the ignore flag.
+- **UDPIN ignores `SERIALx_BAUD`.** The extension does not write baud so a wired UART on the same index is not silently reconfigured.
+- **Missing firmware params are skipped**, not treated as failures — the setup still succeeds on a build without wind-vane support, and the UI reports which rows were unavailable.
+- **The extension does not write the BlueOS serial device string.** That mapping lives in BlueOS, not in ArduPilot parameters — you still paste the two `udpin` strings manually and reboot the autopilot after Save.
+- **Restart the autopilot** after applying parameters that change `SERIALx_PROTOCOL`, `GPS1_TYPE`, or `WNDVN_TYPE` — those are read at boot.
+
+See [ArduRover Wind Vane docs](https://ardupilot.org/rover/docs/wind-vane.html), [ArduPilot NMEA GPS](https://ardupilot.org/copter/docs/common-gps-how-it-works.html), and [EKF Source Selection](https://ardupilot.org/copter/docs/common-ekf-sources.html) for autopilot-side background.
 
 ## ArduPilot mavlink2rest NVF Streaming
 
@@ -101,7 +133,7 @@ Post-flight, comparing the two answers a single diagnostic question: did `$WIMWV
 
 ## Cockpit WebSocket Streaming
 
-The extension streams live wind, GPS, and heading data to Cockpit's data-lake via WebSocket (port 8765). All variables are sent **regardless of the ArduPilot UDP mode**.
+The extension streams live wind, GPS, and heading data to Cockpit's data-lake via WebSocket (port 8765). All variables are sent **regardless of the ArduPilot UDP streaming state**.
 
 ### Variables Streamed
 

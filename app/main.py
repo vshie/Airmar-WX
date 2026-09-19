@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import serial
 import serial.tools.list_ports
 import logging
@@ -33,6 +34,20 @@ try:
 except ImportError:
     HAS_MAVLINK_SENDER = False
 
+try:
+    from mavlink_params import (
+        ParamClient,
+        MIN_SERIAL_INDEX as _MIN_SERIAL_INDEX,
+        MAX_SERIAL_INDEX as _MAX_SERIAL_INDEX,
+        build_expected_params,
+        diff_current_vs_expected,
+        snapshot_from_apply_result,
+        validate_selection,
+    )
+    HAS_MAVLINK_PARAMS = True
+except ImportError:
+    HAS_MAVLINK_PARAMS = False
+
 app = Flask(__name__, static_folder='static')
 CORS(app)
 
@@ -64,12 +79,24 @@ class NMEAHandler:
     # Sentences auto-enabled on connection for dashboard display
     REQUIRED_SENTENCES = ['MWVR', 'MWVT', 'MWD', 'HDT', 'VTG', 'ROT', 'ZDA']
 
-    # Sentence codes forwarded to the autopilot via UDP, keyed by mode.
-    AUTOPILOT_MODES = {
-        'windvane': {'MWV'},                      # ArduRover NMEA wind vane
-        'gps':      {'GGA', 'RMC', 'VTG', 'HDT'}, # External GPS + heading source
-    }
-    DEFAULT_AUTOPILOT_MODE = 'windvane'
+    # ── ArduPilot UDP routes ─────────────────────────────────────────
+    # Two always-active filtered streams. Each route sends only its own set
+    # of NMEA sentences to a dedicated UDP port so a single ArduPilot serial
+    # can be bound to each (BlueOS: `udpin:0.0.0.0:<port>` for SERIALx).
+    #
+    #   Wind route → 27001, drives AP_WindVane_NMEA (WNDVN_TYPE=4)
+    #   GPS route  → 27002, drives AP_GPS NMEA driver (GPS1_TYPE=5) and yaw
+    #
+    # Historically this extension picked one mode at a time and shipped
+    # everything to port 27000. That prevented feeding both drivers because
+    # the wind driver only accepts $??MWV and the GPS driver only accepts
+    # GGA/RMC/VTG/HDT. Two ports keep each driver clean and match the
+    # per-serial protocol model in ArduPilot (SERIALx_PROTOCOL is one value).
+    UDP_HOST = 'host.docker.internal'
+    UDP_WIND_PORT = 27001
+    UDP_GPS_PORT = 27002
+    UDP_WIND_SENTENCES = frozenset({'MWV'})
+    UDP_GPS_SENTENCES = frozenset({'GGA', 'RMC', 'VTG', 'HDT'})
 
     # After probe at 4800, switch to this rate (300WX supports up to 115200 via $PAMTC,BAUD).
     OPERATING_BAUD_RATE = 115200
@@ -129,7 +156,11 @@ class NMEAHandler:
         self.state_path = None
         self.udp_socket = None
         self.is_streaming = False
+        # Per-route counters. `streamed_messages` remains as a legacy total
+        # (wind + gps) so existing callers keep working.
         self.streamed_messages = 0
+        self.streamed_wind_messages = 0
+        self.streamed_gps_messages = 0
         self.messages_received = 0  # Total NMEA messages received since connection
         self.connected_since = None  # epoch seconds when connection established
         self.message_history = []  # Store recent message history
@@ -180,8 +211,20 @@ class NMEAHandler:
             'baud_rate': 4800,
             'stay_at_4800': False,  # persisted; used by startup auto-connect
             'is_streaming': False,
-            'autopilot_mode': self.DEFAULT_AUTOPILOT_MODE,
-            'sentence_config': {}  # { sentence_id: { "enabled": bool, "interval": int (tenths) } }
+            'sentence_config': {},  # { sentence_id: { "enabled": bool, "interval": int (tenths) } }
+            # Persisted ArduRover autopilot setup (see mavlink_params.py).
+            # Populated after the user picks SERIAL X/Y and applies once.
+            # Shape: {
+            #   'wind_serial': int|None,       # SERIALx for the wind (27001) UDPIN
+            #   'gps_serial':  int|None,       # SERIALx for the GPS  (27002) UDPIN
+            #   'use_gps_yaw_fallback': bool,  # also set EK3_SRC1_YAW=3
+            #   'applied': bool,               # first apply succeeded at least once
+            #   'expected': { param: value },  # snapshot to compare current vs
+            #   'ignore_drift': bool,          # user chose Ignore -> never nag
+            #   'last_apply_ts': float,
+            #   'last_apply_result': {...},    # per-param apply outcome
+            # }
+            'autopilot_setup': {}
         }
         # Lock so only one consumer reads from serial (reader thread vs sentence query)
         self._serial_lock = threading.Lock()
@@ -209,6 +252,14 @@ class NMEAHandler:
         # since the publisher started, and the timestamp of the last accept.
         self._mav_publish_count = 0
         self._mav_publish_last_ok_ts = None
+
+        # ArduRover parameter client. Only enabled if mavlink_params imported.
+        # The user picks SERIAL X (wind) and SERIAL Y (GPS); the extension
+        # writes matching ArduPilot parameters once and later checks for drift.
+        self._param_client = ParamClient() if HAS_MAVLINK_PARAMS else None
+        # Serialize check/apply/restore so overlapping UI clicks don't clobber
+        # each other's state.
+        self._autopilot_setup_lock = threading.Lock()
         
         # Aggregated sensor data for dashboard display
         self.sensor_data = {
@@ -291,8 +342,10 @@ class NMEAHandler:
         self.reader_thread = None
         self.should_stop = False
         
-        # Configure logging
-        log_dir = Path('/app/logs')
+        # Configure logging. In production BlueOS binds /app/logs to a host
+        # path that survives restarts. Tests override the location via
+        # AIRMAR_WX_LOG_DIR so nothing needs write access to /app/.
+        log_dir = Path(os.environ.get('AIRMAR_WX_LOG_DIR', '/app/logs'))
         log_dir.mkdir(parents=True, exist_ok=True)
         
         # Set up file handler for NMEA messages
@@ -360,8 +413,15 @@ class NMEAHandler:
                     self.state['stay_at_4800'] = False
                 if 'sentence_config' not in self.state or not isinstance(self.state['sentence_config'], dict):
                     self.state['sentence_config'] = {}
-                if self.state.get('autopilot_mode') not in self.AUTOPILOT_MODES:
-                    self.state['autopilot_mode'] = self.DEFAULT_AUTOPILOT_MODE
+                # Migration: the extension used to pick one of two mutually
+                # exclusive UDP modes ("windvane" / "gps") and shipped a
+                # single stream to port 27000. Both routes are now always
+                # active on 27001 (wind) and 27002 (GPS). Drop the obsolete
+                # key silently so nothing downstream trips on it.
+                if 'autopilot_mode' in self.state:
+                    del self.state['autopilot_mode']
+                if not isinstance(self.state.get('autopilot_setup'), dict):
+                    self.state['autopilot_setup'] = {}
                 self.is_streaming = self.state.get('is_streaming', False)
                 self.app_logger.debug(f"Loaded state: port={self.state['port']}, baud={self.state['baud_rate']}, streaming={self.is_streaming}")
         except Exception as e:
@@ -581,18 +641,26 @@ class NMEAHandler:
         # At most 1 Hz for status (counts/health)
         if now - self._last_status_emit_ts >= 1.0:
             self._last_status_emit_ts = now
-            self._sse_broadcast('stream_status', {
-                'is_streaming': self.is_streaming,
-                'streaming_to': "host.docker.internal:27000" if self.is_streaming else None,
-                'autopilot_mode': self.state.get('autopilot_mode', self.DEFAULT_AUTOPILOT_MODE),
-                'streamed_messages': self.streamed_messages,
-                'messages_received': self.messages_received,
-                'serial_health': self.get_serial_health(),
-                'observed_sentence_last_seen': self.sentence_last_seen,
-                'mavlink_nvf': self.get_mavlink_nvf_status(),
-                'now': now,
-                'connected_since': self.connected_since,
-            })
+            self._sse_broadcast('stream_status', self._stream_status_snapshot(now=now))
+
+    def _stream_status_snapshot(self, now=None):
+        """Single source of truth for stream status (SSE, REST, init)."""
+        if now is None:
+            now = time.time()
+        return {
+            'is_streaming': self.is_streaming,
+            'routes': self.get_stream_routes(),
+            'streamed_messages': self.streamed_messages,
+            'streamed_wind_messages': self.streamed_wind_messages,
+            'streamed_gps_messages': self.streamed_gps_messages,
+            'messages_received': self.messages_received,
+            'serial_health': self.get_serial_health(),
+            'observed_sentence_last_seen': self.sentence_last_seen,
+            'mavlink_nvf': self.get_mavlink_nvf_status(),
+            'autopilot_setup': self.get_autopilot_setup_status(),
+            'now': now,
+            'connected_since': self.connected_since,
+        }
 
     def _read_serial_loop(self):
         """Background thread function for reading serial data. Processes messages as fast as
@@ -663,9 +731,11 @@ class NMEAHandler:
                         # Push derived aggregates/status (throttled)
                         self._emit_sensor_if_due()
                         self._emit_status_if_due()
-                        # Forward to autopilot via UDP based on selected mode.
-                        udp_sentences = self.AUTOPILOT_MODES.get(self.state.get('autopilot_mode'), set())
-                        if self.is_streaming and len(msg_type) >= 3 and msg_type[-3:] in udp_sentences:
+                        # Forward to autopilot via UDP. Both routes are
+                        # always active: `stream_message` picks the right
+                        # port (27001 for wind, 27002 for GPS) or skips
+                        # sentences that neither driver cares about.
+                        if self.is_streaming:
                             self.stream_message(data, msg_type)
                 except Exception as e:
                     err_str = str(e)
@@ -735,7 +805,20 @@ class NMEAHandler:
                         self.sensor_data['wind_true']['source'] = 'WIMWV'
                         self.sensor_data['wind_true']['timestamp'] = timestamp
                         self._record_history('wind_true_speed', speed)
-                        self._record_wind_paired_samples('wind_true_paired', speed, angle)
+                        # The MWV-T angle is BOW-RELATIVE, but the true wind
+                        # rose is north-referenced (same frame as $WIMWD).
+                        # Convert to a true-north "wind from" bearing using the
+                        # current true heading so both sources agree. Without a
+                        # heading we cannot north-reference it, so we skip the
+                        # rose sample to avoid plotting a bow-relative angle in
+                        # a north-referenced chart (which produced a phantom
+                        # second wedge ~180 deg from the real wind).
+                        heading_true = self.sensor_data['attitude'].get('heading_true')
+                        if angle is not None and heading_true is not None:
+                            dir_from_true = (angle + heading_true) % 360
+                            self._record_wind_paired_samples(
+                                'wind_true_paired', speed, dir_from_true
+                            )
             
             # MWD / WIMWD - Wind Direction and Speed (True, relative to north)
             elif msg_type in ('MWD', 'WIMWD'):
@@ -1011,20 +1094,29 @@ class NMEAHandler:
         return self.sensor_data
 
     def start_streaming(self):
-        """Start UDP streaming (idempotent: does not reset counter if already streaming)."""
+        """Start dual-route UDP streaming (idempotent).
+
+        Wind sentences go to `UDP_HOST:UDP_WIND_PORT` (27001) and GPS/
+        heading sentences go to `UDP_HOST:UDP_GPS_PORT` (27002). Both
+        routes share a single socket; each has its own counter.
+        """
         try:
             if not self.udp_socket:
                 self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             if not self.is_streaming:
-                self.streamed_messages = 0  # Reset counter only when actually starting
+                # Reset counters only when actually starting so a re-toggle
+                # after a stop starts fresh, but redundant `start` calls do
+                # not zero the accumulators mid-run.
+                self.streamed_messages = 0
+                self.streamed_wind_messages = 0
+                self.streamed_gps_messages = 0
             self.is_streaming = True
             self.state['is_streaming'] = True
             self.save_state()
-            mode = self.state.get('autopilot_mode', self.DEFAULT_AUTOPILOT_MODE)
-            sentences = self.AUTOPILOT_MODES.get(mode, set())
             self.app_logger.info(
-                "UDP streaming to host.docker.internal:27000 — "
-                "mode=%s, sentences: %s", mode, ', '.join(sorted(sentences))
+                "UDP streaming started — wind %s → %s:%d, gps %s → %s:%d",
+                sorted(self.UDP_WIND_SENTENCES), self.UDP_HOST, self.UDP_WIND_PORT,
+                sorted(self.UDP_GPS_SENTENCES), self.UDP_HOST, self.UDP_GPS_PORT,
             )
             return True, "Streaming started"
         except Exception as e:
@@ -1045,6 +1137,206 @@ class NMEAHandler:
         except Exception as e:
             self.app_logger.error(f"Error stopping UDP stream: {e}")
             return False, str(e)
+
+    def _route_for_sentence(self, msg_type):
+        """Return (port, counter_attr) if `msg_type` maps to a UDP route, else None.
+
+        `msg_type` is the normalized sentence tail from `_nmea_sentence_formatter`
+        (e.g. 'MWV', 'GGA'). Talker-prefixed forms like 'WIMWV' are still
+        matched because we compare the last three characters, which is what
+        the previous single-mode implementation did.
+        """
+        if len(msg_type) < 3:
+            return None
+        tail = msg_type[-3:]
+        if tail in self.UDP_WIND_SENTENCES:
+            return (self.UDP_WIND_PORT, 'streamed_wind_messages')
+        if tail in self.UDP_GPS_SENTENCES:
+            return (self.UDP_GPS_PORT, 'streamed_gps_messages')
+        return None
+
+    def get_stream_routes(self):
+        """UI/status snapshot of both UDP routes and their counters."""
+        return [
+            {
+                'name': 'wind',
+                'sentences': sorted(self.UDP_WIND_SENTENCES),
+                'host': self.UDP_HOST,
+                'port': self.UDP_WIND_PORT,
+                'endpoint': f'{self.UDP_HOST}:{self.UDP_WIND_PORT}',
+                'streamed_messages': self.streamed_wind_messages,
+            },
+            {
+                'name': 'gps',
+                'sentences': sorted(self.UDP_GPS_SENTENCES),
+                'host': self.UDP_HOST,
+                'port': self.UDP_GPS_PORT,
+                'endpoint': f'{self.UDP_HOST}:{self.UDP_GPS_PORT}',
+                'streamed_messages': self.streamed_gps_messages,
+            },
+        ]
+
+    def get_autopilot_setup_status(self):
+        """Snapshot of persisted ArduRover setup state for the UI.
+
+        The heavy lifting (parameter check/apply, drift detection) lives in
+        :mod:`mavlink_params`; this accessor just surfaces the persisted
+        selection so status endpoints and SSE can render the current setup
+        without touching mavlink2rest on every request.
+        """
+        setup = self.state.get('autopilot_setup') or {}
+        return {
+            'enabled': bool(self._param_client is not None),
+            'wind_serial': setup.get('wind_serial'),
+            'gps_serial': setup.get('gps_serial'),
+            'use_gps_yaw_fallback': bool(setup.get('use_gps_yaw_fallback', False)),
+            'applied': bool(setup.get('applied', False)),
+            'ignore_drift': bool(setup.get('ignore_drift', False)),
+            'expected': setup.get('expected') or {},
+            'last_apply_ts': setup.get('last_apply_ts'),
+            'last_apply_result': setup.get('last_apply_result') or {},
+            'min_serial_index': _MIN_SERIAL_INDEX if HAS_MAVLINK_PARAMS else 1,
+            'max_serial_index': _MAX_SERIAL_INDEX if HAS_MAVLINK_PARAMS else 9,
+            'udp_wind_port': self.UDP_WIND_PORT,
+            'udp_gps_port': self.UDP_GPS_PORT,
+            'udpin_wind_string': f'udpin:0.0.0.0:{self.UDP_WIND_PORT}',
+            'udpin_gps_string': f'udpin:0.0.0.0:{self.UDP_GPS_PORT}',
+        }
+
+    # ── ArduRover parameter setup ────────────────────────────────────
+    #
+    # Flow:
+    #   1) UI POSTs SERIAL X / SERIAL Y (and optional yaw fallback flag).
+    #   2) `apply_autopilot_setup` writes each expected param via mavlink2rest
+    #      (verified by a fresh PARAM_VALUE echo). The subset of params the
+    #      autopilot actually has is persisted as `expected`.
+    #   3) `check_autopilot_setup` compares live values against `expected`
+    #      and reports drift; the UI shows a Restore/Ignore banner.
+    #   4) `restore_autopilot_setup` re-applies `expected`.
+    #      `ignore_autopilot_drift` sets `ignore_drift=True` so the banner
+    #      never shows for this X/Y pair again.
+    #
+    # Changing X, Y, or the yaw-fallback flag creates a new expected snapshot
+    # and clears `ignore_drift` — that is a new setup, not the same one
+    # drifting.
+
+    def _apply_and_persist(self, wind_serial, gps_serial, use_gps_yaw_fallback):
+        """Do the actual PARAM_SET pass and persist the expected snapshot."""
+        expected = build_expected_params(
+            int(wind_serial), int(gps_serial), bool(use_gps_yaw_fallback),
+        )
+        result = self._param_client.apply_expected(expected)
+        # `expected` for drift comparisons must only reference params that
+        # actually exist on this autopilot; otherwise the check will scream
+        # forever about e.g. `WNDVN_TYPE` on a build without wind vane.
+        snapshot = snapshot_from_apply_result(result)
+        applied_any = any(row.get('ok') and row.get('action') != 'noop' for row in result.values())
+        available_any = any(row.get('available') for row in result.values())
+        setup = self.state.get('autopilot_setup') or {}
+        setup.update({
+            'wind_serial': int(wind_serial),
+            'gps_serial': int(gps_serial),
+            'use_gps_yaw_fallback': bool(use_gps_yaw_fallback),
+            'applied': bool(available_any),
+            'ignore_drift': False,
+            'expected': snapshot,
+            'last_apply_ts': time.time(),
+            'last_apply_result': result,
+        })
+        self.state['autopilot_setup'] = setup
+        self.save_state()
+        self.app_logger.info(
+            "ArduRover setup applied: wind=SERIAL%d gps=SERIAL%d yaw_fallback=%s "
+            "expected=%s wrote_any=%s",
+            wind_serial, gps_serial, use_gps_yaw_fallback,
+            sorted(snapshot.keys()), applied_any,
+        )
+        return result, snapshot
+
+    def apply_autopilot_setup(self, wind_serial, gps_serial, use_gps_yaw_fallback):
+        """User-triggered apply for a chosen SERIAL X/Y (+ optional yaw)."""
+        if not HAS_MAVLINK_PARAMS or self._param_client is None:
+            return False, 'mavlink parameter client not available', {}
+        ok, err = validate_selection(wind_serial, gps_serial)
+        if not ok:
+            return False, err, {}
+        with self._autopilot_setup_lock:
+            try:
+                result, snapshot = self._apply_and_persist(
+                    wind_serial, gps_serial, use_gps_yaw_fallback,
+                )
+            except Exception as e:
+                self.app_logger.error(f"apply_autopilot_setup failed: {e}")
+                return False, str(e), {}
+        return True, 'applied', {
+            'result': result,
+            'expected': snapshot,
+            'status': self.get_autopilot_setup_status(),
+        }
+
+    def check_autopilot_setup(self):
+        """Compare live autopilot params against the persisted expected set."""
+        if not HAS_MAVLINK_PARAMS or self._param_client is None:
+            return False, 'mavlink parameter client not available', {}
+        setup = self.state.get('autopilot_setup') or {}
+        expected = setup.get('expected') or {}
+        if not expected:
+            return True, 'no setup applied yet', {
+                'expected': {},
+                'current': {},
+                'drift': [],
+                'ignore_drift': bool(setup.get('ignore_drift', False)),
+                'status': self.get_autopilot_setup_status(),
+            }
+        with self._autopilot_setup_lock:
+            current = self._param_client.read_expected(expected)
+        drift = diff_current_vs_expected(current, expected)
+        return True, 'ok', {
+            'expected': expected,
+            'current': current,
+            'drift': drift,
+            'ignore_drift': bool(setup.get('ignore_drift', False)),
+            'status': self.get_autopilot_setup_status(),
+        }
+
+    def restore_autopilot_setup(self):
+        """Re-apply the persisted expected snapshot (Restore button)."""
+        if not HAS_MAVLINK_PARAMS or self._param_client is None:
+            return False, 'mavlink parameter client not available', {}
+        setup = self.state.get('autopilot_setup') or {}
+        wind_serial = setup.get('wind_serial')
+        gps_serial = setup.get('gps_serial')
+        use_gps_yaw_fallback = bool(setup.get('use_gps_yaw_fallback', False))
+        ok, err = validate_selection(wind_serial, gps_serial)
+        if not ok:
+            return False, f'no valid setup to restore: {err}', {}
+        with self._autopilot_setup_lock:
+            try:
+                result, snapshot = self._apply_and_persist(
+                    wind_serial, gps_serial, use_gps_yaw_fallback,
+                )
+            except Exception as e:
+                self.app_logger.error(f"restore_autopilot_setup failed: {e}")
+                return False, str(e), {}
+        return True, 'restored', {
+            'result': result,
+            'expected': snapshot,
+            'status': self.get_autopilot_setup_status(),
+        }
+
+    def ignore_autopilot_drift(self):
+        """Persist ignore_drift=True so the drift banner never returns."""
+        setup = self.state.get('autopilot_setup') or {}
+        if not setup.get('applied'):
+            return False, 'no setup applied yet', {}
+        setup['ignore_drift'] = True
+        self.state['autopilot_setup'] = setup
+        self.save_state()
+        self.app_logger.info(
+            "ArduRover setup drift ignored for wind=SERIAL%s gps=SERIAL%s",
+            setup.get('wind_serial'), setup.get('gps_serial'),
+        )
+        return True, 'ignored', {'status': self.get_autopilot_setup_status()}
 
     def get_mavlink_nvf_status(self):
         """Diagnostics for the NAMED_VALUE_FLOAT publisher, for the UI / SSE."""
@@ -1146,24 +1438,36 @@ class NMEAHandler:
             time.sleep(self._mav_publish_interval_s)
 
     def stream_message(self, message, msg_type):
-        """Stream NMEA message via UDP to autopilot"""
-        if self.is_streaming:
-            try:
-                if not self.udp_socket:
-                    self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    self.app_logger.debug("Created new UDP socket")
+        """Stream one NMEA sentence to the matching UDP route, if any.
 
-                encoded_message = (message + '\n').encode()
-                self.udp_socket.sendto(encoded_message, ('host.docker.internal', 27000))
-                self.streamed_messages += 1
-            except Exception as e:
-                self.app_logger.error(f"Error streaming message: {e}")
-                try:
-                    if self.udp_socket:
-                        self.udp_socket.close()
-                    self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                except Exception as socket_error:
-                    self.app_logger.error(f"Failed to recreate socket: {socket_error}")
+        Each sentence is routed at most once — MWV goes to wind, and
+        GGA/RMC/VTG/HDT go to GPS. Everything else is skipped. Bumps the
+        matching per-route counter and the legacy `streamed_messages` total
+        so existing counters keep counting.
+        """
+        if not self.is_streaming:
+            return
+        route = self._route_for_sentence(msg_type)
+        if route is None:
+            return
+        port, counter_attr = route
+        try:
+            if not self.udp_socket:
+                self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.app_logger.debug("Created new UDP socket")
+
+            encoded_message = (message + '\n').encode()
+            self.udp_socket.sendto(encoded_message, (self.UDP_HOST, port))
+            setattr(self, counter_attr, getattr(self, counter_attr) + 1)
+            self.streamed_messages += 1
+        except Exception as e:
+            self.app_logger.error(f"Error streaming message to {self.UDP_HOST}:{port}: {e}")
+            try:
+                if self.udp_socket:
+                    self.udp_socket.close()
+                self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            except Exception as socket_error:
+                self.app_logger.error(f"Failed to recreate socket: {socket_error}")
 
     # ── Cockpit data-lake WebSocket ──────────────────────────────────
 
@@ -2185,18 +2489,7 @@ def sse_events():
             # Initial snapshot
             init = {
                 'connection': nmea_handler.get_connection_info(),
-                'stream_status': {
-                    'is_streaming': nmea_handler.is_streaming,
-                    'streaming_to': "host.docker.internal:27000" if nmea_handler.is_streaming else None,
-                    'autopilot_mode': nmea_handler.state.get('autopilot_mode', nmea_handler.DEFAULT_AUTOPILOT_MODE),
-                    'streamed_messages': nmea_handler.streamed_messages,
-                    'messages_received': nmea_handler.messages_received,
-                    'serial_health': nmea_handler.get_serial_health(),
-                    'observed_sentence_last_seen': nmea_handler.sentence_last_seen,
-                    'mavlink_nvf': nmea_handler.get_mavlink_nvf_status(),
-                    'now': time.time(),
-                    'connected_since': nmea_handler.connected_since,
-                },
+                'stream_status': nmea_handler._stream_status_snapshot(),
                 'sensor_data': nmea_handler.sensor_data,
                 'messages': nmea_handler.message_history[:50],
             }
@@ -2595,31 +2888,58 @@ def stop_streaming():
 
 @app.route('/api/stream/status', methods=['GET'])
 def get_streaming_status():
-    """Get current streaming status"""
-    mode = nmea_handler.state.get('autopilot_mode', nmea_handler.DEFAULT_AUTOPILOT_MODE)
+    """Get current dual-route streaming status.
+
+    The stream now runs both routes (wind → 27001, GPS → 27002) at the same
+    time; the payload therefore reports a `routes` array with per-port
+    counters plus the persisted ArduRover setup snapshot.
+    """
+    snap = nmea_handler._stream_status_snapshot()
+    snap["port"] = nmea_handler.state.get('port')
+    snap["baud_rate"] = nmea_handler.state.get('baud_rate')
+    return jsonify(snap)
+
+@app.route('/api/autopilot/setup', methods=['GET'])
+def get_autopilot_setup():
+    """Return persisted ArduRover setup snapshot (SERIAL X/Y, flags, expected)."""
     return jsonify({
-        "is_streaming": nmea_handler.is_streaming,
-        "port": nmea_handler.state['port'],
-        "baud_rate": nmea_handler.state['baud_rate'],
-        "autopilot_mode": mode,
-        "streaming_to": "host.docker.internal:27000" if nmea_handler.is_streaming else None,
-        "streamed_messages": nmea_handler.streamed_messages,
-        "messages_received": nmea_handler.messages_received,
-        "serial_health": nmea_handler.get_serial_health(),
+        "success": True,
+        "status": nmea_handler.get_autopilot_setup_status(),
     })
 
-@app.route('/api/stream/autopilot_mode', methods=['POST'])
-def set_autopilot_mode():
-    """Set which data to stream to the autopilot (windvane or gps)"""
-    data = request.get_json()
-    mode = data.get('mode') if data else None
-    if mode not in nmea_handler.AUTOPILOT_MODES:
-        return jsonify({"success": False, "message": f"Invalid mode. Choose from: {list(nmea_handler.AUTOPILOT_MODES.keys())}"})
-    nmea_handler.state['autopilot_mode'] = mode
-    nmea_handler.save_state()
-    sentences = nmea_handler.AUTOPILOT_MODES[mode]
-    nmea_handler.app_logger.info("Autopilot UDP mode changed to '%s' — sentences: %s", mode, ', '.join(sorted(sentences)))
-    return jsonify({"success": True, "mode": mode, "sentences": sorted(sentences)})
+@app.route('/api/autopilot/setup', methods=['POST'])
+def post_autopilot_setup():
+    """Apply the ArduRover parameter setup for the chosen SERIAL X/Y.
+
+    Body: { "wind_serial": int, "gps_serial": int,
+            "use_gps_yaw_fallback": bool (optional, default false) }
+    """
+    data = request.get_json(silent=True) or {}
+    wind_serial = data.get('wind_serial')
+    gps_serial = data.get('gps_serial')
+    yaw = bool(data.get('use_gps_yaw_fallback', False))
+    ok, message, payload = nmea_handler.apply_autopilot_setup(
+        wind_serial, gps_serial, yaw,
+    )
+    return jsonify({"success": ok, "message": message, **payload})
+
+@app.route('/api/autopilot/check', methods=['GET', 'POST'])
+def check_autopilot():
+    """Report parameter drift vs the persisted expected snapshot."""
+    ok, message, payload = nmea_handler.check_autopilot_setup()
+    return jsonify({"success": ok, "message": message, **payload})
+
+@app.route('/api/autopilot/restore', methods=['POST'])
+def restore_autopilot():
+    """Re-apply the persisted expected snapshot (Restore button)."""
+    ok, message, payload = nmea_handler.restore_autopilot_setup()
+    return jsonify({"success": ok, "message": message, **payload})
+
+@app.route('/api/autopilot/ignore_drift', methods=['POST'])
+def ignore_autopilot_drift():
+    """Silence the drift banner permanently for the current SERIAL X/Y pair."""
+    ok, message, payload = nmea_handler.ignore_autopilot_drift()
+    return jsonify({"success": ok, "message": message, **payload})
 
 @app.route('/api/mavlink/nvf_status', methods=['GET'])
 def mavlink_nvf_status():

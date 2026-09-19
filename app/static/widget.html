@@ -265,14 +265,20 @@
         '" stroke="rgba(0,0,0,0.18)" stroke-width="0.65" />';
     }).join('');
 
+    // Apparent wind is bow-relative, so label the axes Bow/Stbd/Stern/Port.
+    // True wind is north-referenced, so keep geographic N/E/S/W.
+    const labels = roseMode === 'apparent'
+      ? { top: 'Bow', right: 'Stbd', bottom: 'Stern', left: 'Port' }
+      : { top: 'N', right: 'E', bottom: 'S', left: 'W' };
+
     container.innerHTML =
       '<svg class="wind-rose-svg" viewBox="0 0 200 200" width="100%" style="max-width:220px;height:auto" aria-hidden="true">' +
       '<circle cx="100" cy="100" r="88" fill="none" stroke="rgba(120,120,120,0.45)" stroke-width="1.25" />' +
       '<g>' + paths + '</g>' +
-      '<text x="100" y="16" text-anchor="middle">N</text>' +
-      '<text x="186" y="104" text-anchor="middle">E</text>' +
-      '<text x="100" y="194" text-anchor="middle">S</text>' +
-      '<text x="14" y="104" text-anchor="middle">W</text>' +
+      '<text x="100" y="16" text-anchor="middle">' + labels.top + '</text>' +
+      '<text x="180" y="104" text-anchor="middle">' + labels.right + '</text>' +
+      '<text x="100" y="194" text-anchor="middle">' + labels.bottom + '</text>' +
+      '<text x="20" y="104" text-anchor="middle">' + labels.left + '</text>' +
       '</svg>';
   }
 
