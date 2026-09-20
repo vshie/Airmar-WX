@@ -257,106 +257,188 @@ class DriftTests(unittest.TestCase):
         self.assertIsNone(drift[0]['current'])
 
 
-class ParamValueParsingTests(unittest.TestCase):
-    def test_extract_from_list_of_chars(self):
-        """Python mavlink2rest emits param_id as a list of 1-char strings."""
-        msg = {
-            'type': 'PARAM_VALUE',
-            'param_id': list('WNDVN_TYPE') + ['\x00'] * (16 - len('WNDVN_TYPE')),
-            'param_value': 4.0,
-        }
-        got = mp.ParamClient._extract_param_value({'message': msg})
-        self.assertEqual(got, ('WNDVN_TYPE', 4.0))
+class _FakeResponse:
+    def __init__(self, status_code=200, text=''):
+        self.status_code = status_code
+        self.text = text
 
-    def test_extract_from_list_of_byte_ints(self):
-        """rust-mavlink (BlueOS ≥1.2) emits param_id as a list of i8 byte
-        values. This is the shape that broke the previous release: the old
-        extractor filtered them out with `isinstance(c, str)` and returned
-        None, which cascaded into "parameter not found on autopilot".
-        """
-        name = 'EK3_SRC2_POSXY'
-        bytes_list = [ord(c) for c in name] + [0] * (16 - len(name))
-        msg = {
+
+class _FakeSession:
+    """Records POSTs / GETs and returns canned responses per URL suffix.
+
+    Suffix-match keys keep the tests readable — the real base URL
+    (`http://host.docker.internal/mavlink2rest`) can be anything as long
+    as the endpoint paths are correct.
+    """
+
+    def __init__(self, get_responses=None, post_responses=None):
+        # dict: url suffix -> _FakeResponse (or callable returning one)
+        self.get_responses = get_responses or {}
+        self.post_responses = post_responses or {}
+        self.gets = []
+        self.posts = []
+
+    def _match(self, table, url):
+        for suffix, response in table.items():
+            if url.endswith(suffix):
+                return response(url) if callable(response) else response
+        return _FakeResponse(404, '')
+
+    def get(self, url, timeout=None):
+        self.gets.append(url)
+        return self._match(self.get_responses, url)
+
+    def post(self, url, json=None, timeout=None):
+        self.posts.append((url, json))
+        return self._match(self.post_responses, url)
+
+
+class Mavlink2RestTransportTests(unittest.TestCase):
+    """The bug that shipped in 1.1.3: mavlink2rest returns HTTP 200 with
+    body `"Failed to parse message, not a valid MAVLinkMessage."` when
+    the payload schema is wrong. The old `_post` didn't check the body,
+    so every rejected PARAM_SET looked like a success and the UI
+    reported "wrote (unverified)" for writes that never went out."""
+
+    def _make_client(self, session):
+        client = mp.ParamClient(base_url='http://fake/mavlink2rest')
+        client._session = session
+        return client
+
+    def test_failed_body_is_treated_as_post_failure(self):
+        session = _FakeSession(post_responses={
+            '/mavlink': _FakeResponse(
+                200,
+                'Failed to parse message, not a valid MAVLinkMessage.',
+            ),
+        })
+        client = self._make_client(session)
+        posted, reason, verified = client.write('WNDVN_TYPE', 4.0, timeout_s=0.1)
+        self.assertFalse(posted, "malformed PARAM_SET must NOT be reported ok")
+        self.assertIn('rejected', reason.lower() + reason)
+        self.assertFalse(verified)
+
+    def test_http_500_is_treated_as_post_failure(self):
+        session = _FakeSession(post_responses={
+            '/mavlink': _FakeResponse(500, 'internal server error'),
+        })
+        client = self._make_client(session)
+        posted, _, verified = client.write('WNDVN_TYPE', 4.0, timeout_s=0.1)
+        self.assertFalse(posted)
+        self.assertFalse(verified)
+
+    def test_success_body_with_matching_echo_is_verified(self):
+        """Full happy path: POST is accepted, and the PARAM_VALUE mailbox
+        returns a body with matching name + value + a fresh stamp."""
+        name = 'SERIAL7_PROTOCOL'
+        # The mailbox response uses mavlink2rest's wrapping shape.
+        mailbox_before = _FakeResponse(200, '')  # empty on first GET
+        mailbox_after = _FakeResponse(200, __import__('json').dumps({
             'header': {'system_id': 1, 'component_id': 1, 'sequence': 0},
             'message': {
                 'type': 'PARAM_VALUE',
-                'param_id': bytes_list,
-                'param_value': 3.0,
-                'param_type': {'type': 'MAV_PARAM_TYPE_REAL32'},
-            },
-        }
-        got = mp.ParamClient._extract_param_value(msg)
-        self.assertEqual(got, ('EK3_SRC2_POSXY', 3.0))
-
-    def test_extract_from_list_of_signed_bytes(self):
-        """i8 values arriving as-is from JSON serializers can include the
-        signed range for the padding; verify the low byte is used."""
-        name = 'GPS1_TYPE'
-        # Fill the rest with a negative "0" (i.e. straight 0). Also splice a
-        # signed negative that maps to a printable ASCII byte to make sure
-        # we don't overreact to it.
-        bytes_list = [ord(c) for c in name] + [0] * (16 - len(name))
-        got = mp.ParamClient._extract_param_value({'message': {
-            'type': 'PARAM_VALUE',
-            'param_id': bytes_list,
-            'param_value': 5.0,
-        }})
-        self.assertEqual(got, ('GPS1_TYPE', 5.0))
-
-    def test_extract_from_string_param_id(self):
-        """Some builds serialize the char array as a padded string."""
-        msg = {
-            'status': {'time': {'first_message': 0, 'last_message': 1}},
-            'message': {
-                'type': 'PARAM_VALUE',
-                'param_id': 'GPS1_TYPE\x00\x00\x00\x00\x00\x00\x00',
-                'param_value': 5,
-            },
-        }
-        got = mp.ParamClient._extract_param_value(msg)
-        self.assertEqual(got, ('GPS1_TYPE', 5.0))
-
-    def test_extract_from_wrapped_dict_param_id(self):
-        """Some serializers wrap fixed-size arrays as {"data": [...]}"""
-        name = 'SERIAL7_PROTOCOL'
-        bytes_list = [ord(c) for c in name] + [0] * (16 - len(name))
-        msg = {
-            'message': {
-                'type': 'PARAM_VALUE',
-                'param_id': {'data': bytes_list},
+                'param_id': list(name) + ['\x00'] * (16 - len(name)),
                 'param_value': 21.0,
             },
-        }
-        got = mp.ParamClient._extract_param_value(msg)
-        self.assertEqual(got, ('SERIAL7_PROTOCOL', 21.0))
+            'status': {'time': {'last_update': 'after-write'}},
+        }))
+        # First call returns 'before', subsequent calls return 'after'.
+        state = {'calls': 0}
+        def mailbox(url):
+            state['calls'] += 1
+            return mailbox_before if state['calls'] == 1 else mailbox_after
 
-    def test_extract_from_wrapped_param_value(self):
-        """param_value may arrive wrapped as {"type": "...", "value": 21.0}"""
+        session = _FakeSession(
+            get_responses={f'/messages/PARAM_VALUE': mailbox},
+            post_responses={'/mavlink': _FakeResponse(200, 'ok')},
+        )
+        client = self._make_client(session)
+        # Skip the /helper/mavlink template lookup by pre-caching an empty
+        # template so build_envelope doesn't try to GET /helper.
+        client._template_cache['PARAM_SET'] = {'message': {}}
+        posted, reason, verified = client.write(name, 21.0, timeout_s=1.0)
+        self.assertTrue(posted, reason)
+        self.assertTrue(verified, reason)
+
+
+class ParamIdDecodingTests(unittest.TestCase):
+    """`_chars_to_str` is the extractor for PARAM_VALUE.param_id and
+    it has to survive every shape mavlink2rest / mavlink-server has
+    ever serialized a `char[16]` field as. This is the single place
+    where a format mismatch turns every apply into a silent no-op."""
+
+    def test_list_of_single_char_strings(self):
+        """Python mavlink2rest and BlueOS's current mavlink-server both
+        emit param_id as a list of single-char strings."""
+        pid = list('WNDVN_TYPE') + ['\x00'] * (16 - len('WNDVN_TYPE'))
+        self.assertEqual(mp._chars_to_str(pid), 'WNDVN_TYPE')
+
+    def test_padded_string(self):
+        """Some builds serialize the char array as a padded string."""
+        pid = 'GPS1_TYPE' + '\x00' * (16 - len('GPS1_TYPE'))
+        self.assertEqual(mp._chars_to_str(pid), 'GPS1_TYPE')
+
+    def test_list_of_byte_ints(self):
+        """Defensive: rust-mavlink can serialize [u8;16] as a JSON list
+        of ASCII byte integers. Handle it so a future serializer flip
+        doesn't silently break apply again."""
         name = 'SERIAL7_PROTOCOL'
-        bytes_list = [ord(c) for c in name] + [0] * (16 - len(name))
-        got = mp.ParamClient._extract_param_value({'message': {
-            'type': 'PARAM_VALUE',
-            'param_id': bytes_list,
-            'param_value': {'type': 'MAV_PARAM_TYPE_REAL32', 'value': 21.0},
-        }})
-        self.assertEqual(got, ('SERIAL7_PROTOCOL', 21.0))
+        pid = [ord(c) for c in name] + [0] * (16 - len(name))
+        self.assertEqual(mp._chars_to_str(pid), 'SERIAL7_PROTOCOL')
 
-    def test_extract_returns_none_for_junk(self):
-        self.assertIsNone(mp.ParamClient._extract_param_value(None))
-        self.assertIsNone(mp.ParamClient._extract_param_value({}))
-        self.assertIsNone(mp.ParamClient._extract_param_value(
-            {'message': {'type': 'HEARTBEAT'}}
-        ))
-        # PARAM_VALUE with no param_id/param_value should not be accepted.
-        self.assertIsNone(mp.ParamClient._extract_param_value(
-            {'message': {'type': 'PARAM_VALUE'}}
-        ))
-        # Non-printable bytes should not be interpreted as a param name.
-        self.assertIsNone(mp.ParamClient._extract_param_value({'message': {
-            'type': 'PARAM_VALUE',
-            'param_id': [0xFF, 0x00, 0x01],
-            'param_value': 1.0,
-        }}))
+    def test_junk_inputs_return_empty(self):
+        self.assertEqual(mp._chars_to_str(None), '')
+        self.assertEqual(mp._chars_to_str([]), '')
+        self.assertEqual(mp._chars_to_str([0, 0, 0]), '')
+
+    def test_non_printable_bytes_are_dropped(self):
+        # 0xFF is not printable ASCII; must not turn into a param name.
+        self.assertEqual(mp._chars_to_str([0xFF, 0x00, 0x01]), '')
+
+    def test_str_to_chars_round_trip(self):
+        chars = mp._str_to_chars('WNDVN_TYPE')
+        self.assertEqual(len(chars), mp.PARAM_ID_LEN)
+        self.assertEqual(mp._chars_to_str(chars), 'WNDVN_TYPE')
+
+
+class ParamValueDecodingTests(unittest.TestCase):
+    """`ParamClient._decode_param_value` takes the PARAM_VALUE message
+    body (already unwrapped from the mavlink2rest envelope) and returns
+    (name, float) so higher-level code doesn't have to care about
+    serializer quirks in `param_value`."""
+
+    def test_plain_float(self):
+        body = {
+            'param_id': list('WNDVN_TYPE') + ['\x00'] * (16 - 10),
+            'param_value': 4.0,
+        }
+        name, value = mp.ParamClient._decode_param_value(body)
+        self.assertEqual(name, 'WNDVN_TYPE')
+        self.assertEqual(value, 4.0)
+
+    def test_int_value(self):
+        body = {
+            'param_id': list('GPS1_TYPE') + ['\x00'] * (16 - 9),
+            'param_value': 5,
+        }
+        name, value = mp.ParamClient._decode_param_value(body)
+        self.assertEqual(name, 'GPS1_TYPE')
+        self.assertEqual(value, 5.0)
+
+    def test_wrapped_value(self):
+        """Some builds emit `param_value` as `{"type": "...", "value": ...}`."""
+        body = {
+            'param_id': list('SERIAL7_PROTOCOL'),
+            'param_value': {'type': 'MAV_PARAM_TYPE_REAL32', 'value': 21.0},
+        }
+        name, value = mp.ParamClient._decode_param_value(body)
+        self.assertEqual(name, 'SERIAL7_PROTOCOL')
+        self.assertEqual(value, 21.0)
+
+    def test_missing_value_returns_none(self):
+        body = {'param_id': list('X') + ['\x00'] * 15}
+        _, value = mp.ParamClient._decode_param_value(body)
+        self.assertIsNone(value)
 
 
 if __name__ == '__main__':
