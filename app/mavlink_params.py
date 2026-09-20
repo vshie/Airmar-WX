@@ -224,6 +224,9 @@ class ParamClient:
         # PARAM_VALUE mailbox per (sys,comp) and interleaved reads would
         # race for it.
         self._lock = threading.Lock()
+        # Log the first PARAM_VALUE response we ever see at INFO so
+        # unknown-shape responses are debuggable from `/app/logs`.
+        self._logged_first_response = False
 
     # -- endpoint selection ------------------------------------------------
 
@@ -256,18 +259,20 @@ class ParamClient:
     def _get_param_value(self) -> Optional[dict]:
         """GET the last PARAM_VALUE message stored by mavlink2rest.
 
-        Returns the decoded JSON (structure varies slightly between
-        mavlink2rest versions) or None. The caller is expected to sanity
-        check the `param_id` field before trusting the value.
+        Returns the decoded JSON (structure varies between mavlink2rest
+        versions — see `_extract_param_value` for the response shapes we
+        support). The caller must sanity-check `param_id` before trusting.
+        Once at INFO, we log the raw first-hit response so operators can
+        share the shape if the extractor ever misses again.
         """
         last_error: Optional[str] = None
         for endpoint in self._candidates():
             base = _get_base_for(endpoint)
-            # Prefer the message-by-name shorthand; fall back to the
-            # component-scoped path some versions expose.
+            # Try the hierarchical path first (mavlink-server / BlueOS ≥1.2
+            # default), then the flat shorthand for older mavlink2rest.
             for url in (
-                f"{base}/mavlink/PARAM_VALUE",
                 f"{base}/mavlink/vehicles/{_AUTOPILOT_SYSTEM_ID}/components/{_AUTOPILOT_COMPONENT_ID}/messages/PARAM_VALUE",
+                f"{base}/mavlink/PARAM_VALUE",
             ):
                 try:
                     r = self._session.get(url, timeout=self._timeout_s)
@@ -276,10 +281,17 @@ class ParamClient:
                     continue
                 if 200 <= r.status_code < 300:
                     try:
-                        return r.json()
+                        payload = r.json()
                     except Exception as e:
                         last_error = f"{url}: json decode: {e}"
                         continue
+                    if not self._logged_first_response:
+                        self._logged_first_response = True
+                        log.info(
+                            "First PARAM_VALUE GET %s -> %s",
+                            url, str(payload)[:400],
+                        )
+                    return payload
                 # 404 is normal until the first PARAM_VALUE ever arrives.
                 last_error = f"{url}: HTTP {r.status_code}"
         if last_error:
@@ -330,38 +342,128 @@ class ParamClient:
         }
 
     # -- PARAM_VALUE parsing ----------------------------------------------
+    #
+    # mavlink2rest response shapes we have to survive:
+    #
+    # 1. Python mavlink2rest (BlueOS ≤ ~1.1):
+    #    {"header": {...}, "message": {"type": "PARAM_VALUE",
+    #     "param_id": ["S","E","R","I","A","L",...], "param_value": 21.0, ...}}
+    # 2. mavlink-server / rust-mavlink (BlueOS ≥ ~1.2, current default):
+    #    param_id serializes as a JSON array of ASCII byte integers
+    #    (`[83, 69, 82, 73, 65, 76, ...]`) because it maps a `[u8;16]` field.
+    #    Some builds serialize `char` arrays as strings — we handle both.
+    # 3. Hierarchical GET (`.../messages/PARAM_VALUE`) sometimes double-
+    #    wraps under `message.message` or under `content.body`.
+    # 4. `param_value` is usually a naked float, but wrapped enum forms
+    #    (`{"type": "MAV_PARAM_TYPE_REAL32", "value": 21.0}`) exist too.
+    #
+    # We treat the response as arbitrary JSON and hunt for the first dict
+    # that has a decodable `param_id` and `param_value`. This is worth the
+    # extra defensive code because a single format mismatch here makes the
+    # entire apply/check flow report "not found on autopilot".
 
     @staticmethod
-    def _extract_param_value(msg: Optional[dict]) -> Optional[Tuple[str, float]]:
-        """Pull (param_id, param_value) out of a PARAM_VALUE JSON blob.
+    def _decode_param_id(pid) -> Optional[str]:
+        """Decode PARAM_VALUE.param_id from any JSON shape into a string.
 
-        mavlink2rest wraps messages differently across versions; we accept
-        either the naked `{message: {...}}` shape or a `{status:{time:{...}},
-        message:{...}}` wrapper.
+        Returns None if the value can't be turned into a plausible param
+        name (empty / not a byte-or-char sequence / etc).
         """
+        if pid is None:
+            return None
+        if isinstance(pid, str):
+            cleaned = pid.replace('\x00', '').strip()
+            return cleaned or None
+        if isinstance(pid, dict):
+            # Some serializers wrap fixed arrays as {"data": [...]} or
+            # {"values": [...]}.
+            for key in ('data', 'values', 'value'):
+                if key in pid:
+                    return ParamClient._decode_param_id(pid[key])
+            return None
+        if isinstance(pid, (list, tuple)):
+            chars: List[str] = []
+            for c in pid:
+                if isinstance(c, str):
+                    if not c or c[0] == '\x00':
+                        break
+                    chars.append(c[0])
+                elif isinstance(c, bool):
+                    # bools are ints in Python, exclude explicitly
+                    return None
+                elif isinstance(c, int):
+                    # rust-mavlink emits i8 as signed integer; a raw 0 is
+                    # NUL and terminates the string. Negative values map
+                    # back to their unsigned byte for legal ASCII.
+                    if c == 0:
+                        break
+                    byte = c & 0xFF
+                    if 0x20 <= byte < 0x7F:  # printable ASCII
+                        chars.append(chr(byte))
+                    else:
+                        # non-printable byte inside a param_id makes no sense
+                        # for ArduPilot parameter names, bail out
+                        return None
+                else:
+                    return None
+            cleaned = ''.join(chars).strip()
+            return cleaned or None
+        return None
+
+    @staticmethod
+    def _decode_param_value(val) -> Optional[float]:
+        """Decode PARAM_VALUE.param_value which may be wrapped."""
+        if val is None:
+            return None
+        if isinstance(val, bool):
+            return float(val)  # unlikely, but be explicit
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            try:
+                return float(val)
+            except ValueError:
+                return None
+        if isinstance(val, dict):
+            for key in ('value', 'val', 'data'):
+                if key in val:
+                    return ParamClient._decode_param_value(val[key])
+        return None
+
+    @staticmethod
+    def _find_param_value_body(obj) -> Optional[dict]:
+        """Descend into the response and return the dict that carries
+        `param_id` + `param_value`. Returns None if nothing matches.
+        """
+        if not isinstance(obj, dict):
+            return None
+        # Direct hit: this dict itself carries the PARAM_VALUE fields.
+        if 'param_id' in obj and 'param_value' in obj:
+            return obj
+        # Recurse through common wrapper keys.
+        for key in ('message', 'body', 'content', 'data', 'msg', 'PARAM_VALUE'):
+            child = obj.get(key)
+            if isinstance(child, dict):
+                found = ParamClient._find_param_value_body(child)
+                if found is not None:
+                    return found
+        return None
+
+    @classmethod
+    def _extract_param_value(cls, msg: Optional[dict]) -> Optional[Tuple[str, float]]:
+        """Pull (param_id, param_value) out of a PARAM_VALUE JSON blob."""
         if not isinstance(msg, dict):
             return None
-        message = msg.get('message', msg)
-        if not isinstance(message, dict):
+        body = cls._find_param_value_body(msg)
+        if body is None:
             return None
-        if message.get('type') not in (None, 'PARAM_VALUE'):
-            return None
-        pid = message.get('param_id')
-        if isinstance(pid, list):
-            name = ''.join(c for c in pid if isinstance(c, str) and c != '\x00').strip()
-        elif isinstance(pid, str):
-            name = pid.replace('\x00', '').strip()
-        else:
-            return None
+        name = cls._decode_param_id(body.get('param_id'))
         if not name:
             return None
-        value = message.get('param_value')
+        value = cls._decode_param_value(body.get('param_value'))
         if value is None:
             return None
-        try:
-            return name, float(value)
-        except (TypeError, ValueError):
-            return None
+        return name, value
 
     # -- public API --------------------------------------------------------
 
@@ -393,19 +495,27 @@ class ParamClient:
                 time.sleep(poll_interval)
         return None
 
-    def write(self, name: str, value: float, timeout_s: float = 5.0) -> Tuple[bool, str]:
-        """Write `value` to `name` and confirm via a fresh PARAM_VALUE echo.
+    def write(self, name: str, value: float,
+              timeout_s: float = 3.0) -> Tuple[bool, str, bool]:
+        """POST PARAM_SET, then best-effort verify via PARAM_VALUE echo.
 
-        We snapshot the current PARAM_VALUE (name+value) before POSTing so
-        we can detect a stale mailbox hit. Success requires seeing a
-        PARAM_VALUE whose name matches AND whose value is close to what we
-        just wrote, arriving strictly after the POST.
+        Returns `(posted_ok, reason, verified)`:
+          * `posted_ok` is True iff mavlink2rest accepted the POST (2xx).
+            ArduPilot silently ignores PARAM_SETs for parameters that
+            don't exist on the current firmware, so a 2xx does NOT prove
+            the value stuck — it only proves the packet went out on the
+            wire. The Check step surfaces truth via a full read.
+          * `verified` is True iff we also received a fresh PARAM_VALUE
+            echo naming `name` with a value that matches. If the transport
+            is unreliable or the mailbox is dominated by other params,
+            we may miss the echo even though the write took — hence
+            `posted_ok=True, verified=False` is a legitimate outcome.
         """
         with self._lock:
             request_ts = time.monotonic()
             ok, err = self._post(self._param_set_payload(name, value))
             if not ok:
-                return False, f"POST failed: {err or 'unknown error'}"
+                return False, f"POST failed: {err or 'unknown error'}", False
             deadline = request_ts + timeout_s
             poll_interval = 0.15
             re_request_at = request_ts + 1.5
@@ -416,18 +526,22 @@ class ParamClient:
                 if pair is not None:
                     last_seen = pair
                     if pair[0] == name and _values_match(pair[1], value):
-                        return True, 'ok'
+                        return True, 'verified via PARAM_VALUE echo', True
                 if time.monotonic() >= re_request_at:
                     # Nudge the autopilot to re-emit PARAM_VALUE for `name`
-                    # so we do not stall waiting for a broadcast update.
+                    # so we don't stall waiting for a broadcast update.
                     self._post(self._param_request_read_payload(name))
                     re_request_at = time.monotonic() + 1.5
                 time.sleep(poll_interval)
+        # POST was accepted; verification failed. Do NOT treat this as a
+        # write failure — the write likely took and the drift check will
+        # reveal the truth.
         if last_seen is None:
-            return False, 'timed out waiting for PARAM_VALUE'
-        return False, (
-            f"timed out; last PARAM_VALUE was {last_seen[0]}={last_seen[1]!r}"
-        )
+            return True, 'posted; no PARAM_VALUE echo within timeout', False
+        return True, (
+            f"posted; last PARAM_VALUE was {last_seen[0]}={last_seen[1]!r} "
+            f"(expected {name}={value!r})"
+        ), False
 
     # -- higher-level operations ------------------------------------------
 
@@ -438,6 +552,10 @@ class ParamClient:
             'target': float, 'current': float|None, 'match': bool,
             'resolved_name': str|None, 'available': bool, 'reason': str
         }}.
+        `available=False` here means "no PARAM_VALUE echo received within
+        the read timeout" — that can mean the param genuinely doesn't
+        exist, OR that the echo transport is unreliable. The caller
+        should not conclude the param is missing based on a single read.
         """
         out: Dict[str, dict] = {}
         for name, target in expected.items():
@@ -458,17 +576,33 @@ class ParamClient:
                     row['match'] = _values_match(current, target)
                     break
             if not row['available']:
-                row['reason'] = 'parameter not found on autopilot'
+                row['reason'] = 'no PARAM_VALUE echo within timeout'
+                log.debug("read_expected: %s echoed nothing", name)
             out[name] = row
         return out
 
     def apply_expected(self, expected: Dict[str, float]) -> Dict[str, dict]:
-        """Write every expected param, skipping ones that already match.
+        """Write every expected param via mavlink2rest.
 
-        Returns { canonical_name: {
-            'target', 'previous', 'current', 'action', 'ok', 'reason',
-            'resolved_name', 'available'
-        }} where `action` is one of 'noop', 'wrote', 'skipped', 'failed'.
+        Never gates on the pre-read succeeding: if the read echo path is
+        broken (mismatched serializer, mailbox thrashed by another GCS,
+        etc.) we still POST the PARAM_SET and let the drift check reveal
+        whether it stuck. This avoids the pathological state where every
+        param is reported as "not found on autopilot" while all writes
+        would actually have taken.
+
+        Actions used:
+          * `noop`              — pre-read confirmed the value already matches.
+          * `wrote`             — POST accepted AND fresh PARAM_VALUE echo
+                                  verified the new value.
+          * `wrote_unverified`  — POST accepted, but no matching PARAM_VALUE
+                                  echo arrived (echo transport unreliable).
+                                  Treated as `ok=True`; the check step
+                                  will surface truth.
+          * `failed`            — POST rejected by mavlink2rest.
+
+        Returns {canonical_name: {target, previous, current, action, ok,
+            reason, resolved_name, available}}.
         """
         out: Dict[str, dict] = {}
         for name, target in expected.items():
@@ -476,41 +610,58 @@ class ParamClient:
                 'target': float(target),
                 'previous': None,
                 'current': None,
-                'action': 'skipped',
+                'action': 'failed',
                 'ok': False,
                 'reason': '',
                 'resolved_name': None,
                 'available': False,
             }
-            resolved: Optional[str] = None
-            for alias in _param_synonyms(name):
-                previous = self.read(alias)
-                if previous is not None:
+            # Best-effort synonym resolution + pre-read. If neither read
+            # returns, keep the canonical name and press on with the write.
+            aliases = _param_synonyms(name)
+            resolved: str = aliases[0]
+            previous: Optional[float] = None
+            for alias in aliases:
+                got = self.read(alias, timeout_s=1.5)
+                if got is not None:
                     resolved = alias
-                    row['resolved_name'] = alias
+                    previous = got
                     row['available'] = True
                     row['previous'] = previous
-                    if _values_match(previous, target):
-                        row['action'] = 'noop'
-                        row['current'] = previous
-                        row['ok'] = True
+                    row['current'] = previous
                     break
-            if not row['available']:
-                row['reason'] = 'parameter not found on autopilot; skipped'
-                out[name] = row
-                continue
-            if row['ok']:
-                out[name] = row
-                continue
-            ok, why = self.write(resolved, target)
-            if ok:
-                row['action'] = 'wrote'
+            row['resolved_name'] = resolved
+
+            # No-op fast path: value already matches.
+            if previous is not None and _values_match(previous, target):
+                row['action'] = 'noop'
                 row['ok'] = True
-                row['current'] = float(target)
-            else:
+                out[name] = row
+                log.info("param %s already %s (noop)", resolved, previous)
+                continue
+
+            # Write. Both verified and unverified count as "posted"; only
+            # a hard POST failure short-circuits.
+            posted, why, verified = self.write(resolved, target)
+            if not posted:
                 row['action'] = 'failed'
                 row['ok'] = False
                 row['reason'] = why
+                log.warning("param %s write failed: %s", resolved, why)
+                out[name] = row
+                continue
+            row['ok'] = True
+            row['current'] = float(target)
+            if verified:
+                row['action'] = 'wrote'
+                row['available'] = True
+                log.info("param %s wrote %s (verified)", resolved, target)
+            else:
+                row['action'] = 'wrote_unverified'
+                row['reason'] = why
+                log.info(
+                    "param %s wrote %s (unverified; %s)", resolved, target, why,
+                )
             out[name] = row
         return out
 
@@ -520,12 +671,15 @@ class ParamClient:
 def snapshot_from_apply_result(result: Dict[str, dict]) -> Dict[str, float]:
     """Build the persisted `expected` snapshot from an apply result.
 
-    Only params the autopilot actually has get into the snapshot — missing
-    ones would otherwise cause the drift check to warn on every poll.
+    Include every param the client considered a successful post (`ok=True`),
+    verified or not. Excluding unverified writes would defeat the purpose
+    of the drift check — the whole point of the check is to reveal whether
+    an unverified write actually landed. Params whose POST hard-failed
+    are excluded so we don't nag about them forever.
     """
     snap: Dict[str, float] = {}
     for name, row in (result or {}).items():
-        if not row.get('available'):
+        if not row.get('ok'):
             continue
         target = row.get('target')
         if target is None:

@@ -1221,23 +1221,29 @@ class NMEAHandler:
     # drifting.
 
     def _apply_and_persist(self, wind_serial, gps_serial, use_gps_yaw_fallback):
-        """Do the actual PARAM_SET pass and persist the expected snapshot."""
+        """Do the actual PARAM_SET pass and persist the expected snapshot.
+
+        `applied` on the persisted setup tracks whether we successfully
+        POSTed any writes to mavlink2rest — verified or not. It does NOT
+        track whether the PARAM_VALUE echo transport is working, because
+        that turned out to be unreliable across mavlink2rest builds and
+        caused every apply to look like it did nothing.
+        """
         expected = build_expected_params(
             int(wind_serial), int(gps_serial), bool(use_gps_yaw_fallback),
         )
         result = self._param_client.apply_expected(expected)
-        # `expected` for drift comparisons must only reference params that
-        # actually exist on this autopilot; otherwise the check will scream
-        # forever about e.g. `WNDVN_TYPE` on a build without wind vane.
+        # Snapshot covers every param whose POST succeeded, so the drift
+        # check has something to compare against later even when the
+        # PARAM_VALUE echo did not arrive in time during apply.
         snapshot = snapshot_from_apply_result(result)
-        applied_any = any(row.get('ok') and row.get('action') != 'noop' for row in result.values())
-        available_any = any(row.get('available') for row in result.values())
+        posted_any = any(row.get('ok') for row in result.values())
         setup = self.state.get('autopilot_setup') or {}
         setup.update({
             'wind_serial': int(wind_serial),
             'gps_serial': int(gps_serial),
             'use_gps_yaw_fallback': bool(use_gps_yaw_fallback),
-            'applied': bool(available_any),
+            'applied': bool(posted_any),
             'ignore_drift': False,
             'expected': snapshot,
             'last_apply_ts': time.time(),
@@ -1245,11 +1251,16 @@ class NMEAHandler:
         })
         self.state['autopilot_setup'] = setup
         self.save_state()
+        # Bucket outcomes for a concise log line.
+        counts = {'noop': 0, 'wrote': 0, 'wrote_unverified': 0, 'failed': 0}
+        for row in result.values():
+            action = row.get('action') or 'failed'
+            counts[action] = counts.get(action, 0) + 1
         self.app_logger.info(
             "ArduRover setup applied: wind=SERIAL%d gps=SERIAL%d yaw_fallback=%s "
-            "expected=%s wrote_any=%s",
+            "counts=%s expected=%s",
             wind_serial, gps_serial, use_gps_yaw_fallback,
-            sorted(snapshot.keys()), applied_any,
+            counts, sorted(snapshot.keys()),
         )
         return result, snapshot
 
@@ -1275,7 +1286,13 @@ class NMEAHandler:
         }
 
     def check_autopilot_setup(self):
-        """Compare live autopilot params against the persisted expected set."""
+        """Compare live autopilot params against the persisted expected set.
+
+        If every read returned no PARAM_VALUE echo we treat that as a
+        transport failure (mavlink2rest wedged, autopilot silent, etc.)
+        rather than reporting every param as drifted — the latter would
+        panic the user into hitting Restore repeatedly on nothing.
+        """
         if not HAS_MAVLINK_PARAMS or self._param_client is None:
             return False, 'mavlink parameter client not available', {}
         setup = self.state.get('autopilot_setup') or {}
@@ -1290,6 +1307,22 @@ class NMEAHandler:
             }
         with self._autopilot_setup_lock:
             current = self._param_client.read_expected(expected)
+        # Transport-failure short-circuit: if not one param echoed back,
+        # we can't tell whether they drifted or the transport is broken.
+        # Report the ambiguity honestly instead of manufacturing drift.
+        if current and not any(row.get('available') for row in current.values()):
+            return True, (
+                'unable to read autopilot params via mavlink2rest '
+                '(no PARAM_VALUE echoes received); check that mavlink2rest is '
+                'running and the autopilot is connected'
+            ), {
+                'expected': expected,
+                'current': current,
+                'drift': [],
+                'ignore_drift': bool(setup.get('ignore_drift', False)),
+                'status': self.get_autopilot_setup_status(),
+                'transport_ok': False,
+            }
         drift = diff_current_vs_expected(current, expected)
         return True, 'ok', {
             'expected': expected,
@@ -1297,6 +1330,7 @@ class NMEAHandler:
             'drift': drift,
             'ignore_drift': bool(setup.get('ignore_drift', False)),
             'status': self.get_autopilot_setup_status(),
+            'transport_ok': True,
         }
 
     def restore_autopilot_setup(self):

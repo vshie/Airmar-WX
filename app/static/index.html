@@ -879,6 +879,22 @@
                           </v-btn>
                         </div>
 
+                        <!-- Transport-failure banner: mavlink2rest didn't
+                             echo any params back, so we can't say whether
+                             they drifted. Only shown when a setup has been
+                             applied so a fresh installation stays clean. -->
+                        <v-alert
+                          v-if="autopilotSetup.applied &&
+                                autopilotSetup.transport_ok === false &&
+                                autopilotSetup.transport_message"
+                          type="info"
+                          outlined
+                          dense
+                          class="mt-4 mb-0"
+                        >
+                          {{ autopilotSetup.transport_message }}
+                        </v-alert>
+
                         <v-alert
                           v-if="autopilotDriftBannerVisible"
                           type="warning"
@@ -1922,6 +1938,11 @@
           ignore_drift: false,
           expected: {},
           drift: [],
+          // Set by checkAutopilotSetup() from the /api/autopilot/check
+          // response so the UI can distinguish "no drift" from "we
+          // couldn't read anything back over mavlink2rest".
+          transport_ok: true,
+          transport_message: '',
           min_serial_index: 1,
           max_serial_index: 9,
           udpin_wind_string: 'udpin:0.0.0.0:27001',
@@ -3210,9 +3231,16 @@
             const r = await axios.get('/api/autopilot/check');
             if (r.data && r.data.status) this.mergeAutopilotSetup(r.data.status);
             if (r.data) {
+              const drift = Array.isArray(r.data.drift) ? r.data.drift : [];
+              // transport_ok=false means we couldn't read anything back
+              // via mavlink2rest — surface the reason instead of pretending
+              // the check succeeded or manufacturing drift.
+              const transportOk = r.data.transport_ok !== false;
               this.autopilotSetup = Object.assign({}, this.autopilotSetup, {
-                drift: Array.isArray(r.data.drift) ? r.data.drift : [],
-                ignore_drift: !!r.data.ignore_drift
+                drift: drift,
+                ignore_drift: !!r.data.ignore_drift,
+                transport_ok: transportOk,
+                transport_message: transportOk ? '' : (r.data.message || ''),
               });
             }
           } catch (e) { /* best-effort */ }
@@ -3251,6 +3279,11 @@
             const row = result[k] || {};
             if (row.action === 'noop') return `${k}: already set`;
             if (row.action === 'wrote') return `${k}: wrote ${row.target}`;
+            if (row.action === 'wrote_unverified') {
+              // POST accepted but the PARAM_VALUE echo didn't come back
+              // in time; the Check button will confirm truth.
+              return `${k}: wrote ${row.target} (unverified — click Check)`;
+            }
             if (row.action === 'skipped') return `${k}: skipped (${row.reason || 'unavailable'})`;
             if (row.action === 'failed') return `${k}: failed (${row.reason || 'unknown'})`;
             return `${k}: ${row.action || 'unknown'}`;

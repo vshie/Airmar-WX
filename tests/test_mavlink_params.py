@@ -85,33 +85,51 @@ class SynonymTests(unittest.TestCase):
 
 
 class _FakeClient(mp.ParamClient):
-    """ParamClient with `read` and `write` replaced by an in-memory store."""
+    """ParamClient with `read` and `write` replaced by an in-memory store.
 
-    def __init__(self, existing=None):
+    Simulates the important real-world edge case: the mavlink2rest PARAM_VALUE
+    echo path can be flaky even when writes go through. Callers can pass
+    `readable=False` to model "writes work, reads all time out" — that used
+    to make `apply_expected` report every param as "not found on autopilot",
+    which is the bug we're guarding against here.
+    """
+
+    def __init__(self, existing=None, readable=True, write_fails=None):
         # Skip HTTP setup.
         self.existing = dict(existing or {})
+        self.readable = readable
+        self.write_fails = set(write_fails or ())
         self.writes = []
 
     def read(self, name, timeout_s=3.0):
+        if not self.readable:
+            return None
         return self.existing.get(name)
 
     def write(self, name, value, timeout_s=5.0):
         self.writes.append((name, value))
+        if name in self.write_fails:
+            return False, 'simulated POST failure', False
         self.existing[name] = float(value)
-        return True, 'ok'
+        # Model "posted and verified" by default; the transport-unreliable
+        # variant is `_FakeClient(readable=False)` which also implies verify
+        # can't complete (no echo mailbox to poll).
+        return True, 'ok', bool(self.readable)
 
 
 class ApplyExpectedTests(unittest.TestCase):
-    def test_apply_wrote_and_noop_and_skipped(self):
-        # Autopilot already has SERIAL2_PROTOCOL=21 (noop) and GPS_TYPE
-        # (legacy) but not GPS1_TYPE. WNDVN_* absent -> skipped.
+    def test_apply_wrote_and_noop(self):
+        # Autopilot already has SERIAL2_PROTOCOL=21 (noop). GPS_TYPE
+        # (legacy) resolves as a synonym for GPS1_TYPE.
         client = _FakeClient({
             'SERIAL2_PROTOCOL': 21.0,
             'SERIAL3_PROTOCOL': 0.0,
-            'GPS_TYPE': 0.0,          # will be resolved as synonym for GPS1_TYPE
+            'GPS_TYPE': 0.0,          # legacy alias present, GPS1_TYPE not
             'EK3_SRC2_YAW': 1.0,
             'EK3_SRC2_POSXY': 0.0,
             'EK3_SRC2_VELXY': 0.0,
+            'WNDVN_TYPE': 0.0,
+            'WNDVN_SPEED_TYPE': 0.0,
         })
         exp = mp.build_expected_params(2, 3, False)
         result = client.apply_expected(exp)
@@ -126,27 +144,82 @@ class ApplyExpectedTests(unittest.TestCase):
         self.assertEqual(result['GPS1_TYPE']['resolved_name'], 'GPS_TYPE')
         self.assertEqual(result['GPS1_TYPE']['action'], 'wrote')
 
-        # WNDVN_TYPE / WNDVN_SPEED_TYPE missing -> skipped, not failed.
-        self.assertEqual(result['WNDVN_TYPE']['action'], 'skipped')
-        self.assertFalse(result['WNDVN_TYPE']['available'])
-        self.assertFalse(result['WNDVN_TYPE']['ok'])
+        self.assertEqual(result['WNDVN_TYPE']['action'], 'wrote')
+        self.assertTrue(result['WNDVN_TYPE']['ok'])
 
-    def test_snapshot_only_contains_available_params(self):
-        client = _FakeClient({
-            'SERIAL2_PROTOCOL': 0.0,
-            'SERIAL3_PROTOCOL': 0.0,
-            # WNDVN_* and GPS types missing -> should NOT appear in the snapshot.
-            'EK3_SRC2_YAW': 0.0,
-            'EK3_SRC2_POSXY': 0.0,
-            'EK3_SRC2_VELXY': 0.0,
-        })
+    def test_unreadable_transport_still_posts_writes(self):
+        """Regression: when the PARAM_VALUE echo transport is broken,
+        apply_expected must NOT report every param as "not found" — it
+        must still POST the PARAM_SETs and mark them as wrote_unverified.
+        """
+        client = _FakeClient(existing={
+            # These exist on the FC but reads all fail (readable=False).
+            'SERIAL7_PROTOCOL': 0.0, 'SERIAL8_PROTOCOL': 0.0,
+            'WNDVN_TYPE': 0.0, 'WNDVN_SPEED_TYPE': 0.0,
+            'GPS1_TYPE': 0.0, 'EK3_SRC2_YAW': 0.0,
+            'EK3_SRC2_POSXY': 0.0, 'EK3_SRC2_VELXY': 0.0,
+        }, readable=False)
+        exp = mp.build_expected_params(7, 8, False)
+        result = client.apply_expected(exp)
+
+        # Every row must be a successful post, unverified because reads
+        # are broken — but crucially not 'skipped' with "not found".
+        for name, row in result.items():
+            self.assertTrue(row['ok'], f"{name} should be ok: {row}")
+            self.assertEqual(
+                row['action'], 'wrote_unverified',
+                f"{name} should be wrote_unverified: {row}",
+            )
+        # And every write actually happened on the fake FC.
+        written = {name for name, _ in client.writes}
+        self.assertIn('SERIAL7_PROTOCOL', written)
+        self.assertIn('SERIAL8_PROTOCOL', written)
+        self.assertIn('WNDVN_TYPE', written)
+
+    def test_post_failure_marks_failed(self):
+        client = _FakeClient(
+            existing={'SERIAL2_PROTOCOL': 0.0, 'SERIAL3_PROTOCOL': 0.0,
+                      'WNDVN_TYPE': 0.0, 'WNDVN_SPEED_TYPE': 0.0,
+                      'GPS1_TYPE': 0.0, 'EK3_SRC2_YAW': 0.0,
+                      'EK3_SRC2_POSXY': 0.0, 'EK3_SRC2_VELXY': 0.0},
+            write_fails={'WNDVN_TYPE'},
+        )
+        exp = mp.build_expected_params(2, 3, False)
+        result = client.apply_expected(exp)
+        self.assertEqual(result['WNDVN_TYPE']['action'], 'failed')
+        self.assertFalse(result['WNDVN_TYPE']['ok'])
+        # Other params still went through.
+        self.assertEqual(result['SERIAL2_PROTOCOL']['action'], 'wrote')
+
+    def test_snapshot_includes_verified_and_unverified_writes(self):
+        # Unverified writes MUST be snapshotted so the Check step later
+        # can surface truth — that's the whole point of the drift check.
+        client = _FakeClient(existing={
+            'SERIAL2_PROTOCOL': 0.0, 'SERIAL3_PROTOCOL': 0.0,
+            'WNDVN_TYPE': 0.0, 'WNDVN_SPEED_TYPE': 0.0,
+            'GPS1_TYPE': 0.0, 'EK3_SRC2_YAW': 0.0,
+            'EK3_SRC2_POSXY': 0.0, 'EK3_SRC2_VELXY': 0.0,
+        }, readable=False)
         exp = mp.build_expected_params(2, 3, False)
         result = client.apply_expected(exp)
         snap = mp.snapshot_from_apply_result(result)
-        self.assertIn('SERIAL2_PROTOCOL', snap)
-        self.assertIn('SERIAL3_PROTOCOL', snap)
+        # Every expected param made it into the snapshot.
+        for k in exp:
+            self.assertIn(k, snap, f"{k} missing from snapshot: {snap}")
+
+    def test_snapshot_excludes_failed_posts(self):
+        client = _FakeClient(
+            existing={'SERIAL2_PROTOCOL': 0.0, 'SERIAL3_PROTOCOL': 0.0,
+                      'WNDVN_TYPE': 0.0, 'WNDVN_SPEED_TYPE': 0.0,
+                      'GPS1_TYPE': 0.0, 'EK3_SRC2_YAW': 0.0,
+                      'EK3_SRC2_POSXY': 0.0, 'EK3_SRC2_VELXY': 0.0},
+            write_fails={'WNDVN_TYPE'},
+        )
+        exp = mp.build_expected_params(2, 3, False)
+        result = client.apply_expected(exp)
+        snap = mp.snapshot_from_apply_result(result)
         self.assertNotIn('WNDVN_TYPE', snap)
-        self.assertNotIn('GPS1_TYPE', snap)
+        self.assertIn('SERIAL2_PROTOCOL', snap)
 
 
 class DriftTests(unittest.TestCase):
@@ -185,7 +258,8 @@ class DriftTests(unittest.TestCase):
 
 
 class ParamValueParsingTests(unittest.TestCase):
-    def test_extract_from_naked_message(self):
+    def test_extract_from_list_of_chars(self):
+        """Python mavlink2rest emits param_id as a list of 1-char strings."""
         msg = {
             'type': 'PARAM_VALUE',
             'param_id': list('WNDVN_TYPE') + ['\x00'] * (16 - len('WNDVN_TYPE')),
@@ -194,7 +268,43 @@ class ParamValueParsingTests(unittest.TestCase):
         got = mp.ParamClient._extract_param_value({'message': msg})
         self.assertEqual(got, ('WNDVN_TYPE', 4.0))
 
-    def test_extract_from_wrapped_message(self):
+    def test_extract_from_list_of_byte_ints(self):
+        """rust-mavlink (BlueOS ≥1.2) emits param_id as a list of i8 byte
+        values. This is the shape that broke the previous release: the old
+        extractor filtered them out with `isinstance(c, str)` and returned
+        None, which cascaded into "parameter not found on autopilot".
+        """
+        name = 'EK3_SRC2_POSXY'
+        bytes_list = [ord(c) for c in name] + [0] * (16 - len(name))
+        msg = {
+            'header': {'system_id': 1, 'component_id': 1, 'sequence': 0},
+            'message': {
+                'type': 'PARAM_VALUE',
+                'param_id': bytes_list,
+                'param_value': 3.0,
+                'param_type': {'type': 'MAV_PARAM_TYPE_REAL32'},
+            },
+        }
+        got = mp.ParamClient._extract_param_value(msg)
+        self.assertEqual(got, ('EK3_SRC2_POSXY', 3.0))
+
+    def test_extract_from_list_of_signed_bytes(self):
+        """i8 values arriving as-is from JSON serializers can include the
+        signed range for the padding; verify the low byte is used."""
+        name = 'GPS1_TYPE'
+        # Fill the rest with a negative "0" (i.e. straight 0). Also splice a
+        # signed negative that maps to a printable ASCII byte to make sure
+        # we don't overreact to it.
+        bytes_list = [ord(c) for c in name] + [0] * (16 - len(name))
+        got = mp.ParamClient._extract_param_value({'message': {
+            'type': 'PARAM_VALUE',
+            'param_id': bytes_list,
+            'param_value': 5.0,
+        }})
+        self.assertEqual(got, ('GPS1_TYPE', 5.0))
+
+    def test_extract_from_string_param_id(self):
+        """Some builds serialize the char array as a padded string."""
         msg = {
             'status': {'time': {'first_message': 0, 'last_message': 1}},
             'message': {
@@ -206,10 +316,47 @@ class ParamValueParsingTests(unittest.TestCase):
         got = mp.ParamClient._extract_param_value(msg)
         self.assertEqual(got, ('GPS1_TYPE', 5.0))
 
+    def test_extract_from_wrapped_dict_param_id(self):
+        """Some serializers wrap fixed-size arrays as {"data": [...]}"""
+        name = 'SERIAL7_PROTOCOL'
+        bytes_list = [ord(c) for c in name] + [0] * (16 - len(name))
+        msg = {
+            'message': {
+                'type': 'PARAM_VALUE',
+                'param_id': {'data': bytes_list},
+                'param_value': 21.0,
+            },
+        }
+        got = mp.ParamClient._extract_param_value(msg)
+        self.assertEqual(got, ('SERIAL7_PROTOCOL', 21.0))
+
+    def test_extract_from_wrapped_param_value(self):
+        """param_value may arrive wrapped as {"type": "...", "value": 21.0}"""
+        name = 'SERIAL7_PROTOCOL'
+        bytes_list = [ord(c) for c in name] + [0] * (16 - len(name))
+        got = mp.ParamClient._extract_param_value({'message': {
+            'type': 'PARAM_VALUE',
+            'param_id': bytes_list,
+            'param_value': {'type': 'MAV_PARAM_TYPE_REAL32', 'value': 21.0},
+        }})
+        self.assertEqual(got, ('SERIAL7_PROTOCOL', 21.0))
+
     def test_extract_returns_none_for_junk(self):
         self.assertIsNone(mp.ParamClient._extract_param_value(None))
-        self.assertIsNone(mp.ParamClient._extract_param_value({'message': {'type': 'HEARTBEAT'}}))
-        self.assertIsNone(mp.ParamClient._extract_param_value({'message': {'type': 'PARAM_VALUE'}}))
+        self.assertIsNone(mp.ParamClient._extract_param_value({}))
+        self.assertIsNone(mp.ParamClient._extract_param_value(
+            {'message': {'type': 'HEARTBEAT'}}
+        ))
+        # PARAM_VALUE with no param_id/param_value should not be accepted.
+        self.assertIsNone(mp.ParamClient._extract_param_value(
+            {'message': {'type': 'PARAM_VALUE'}}
+        ))
+        # Non-printable bytes should not be interpreted as a param name.
+        self.assertIsNone(mp.ParamClient._extract_param_value({'message': {
+            'type': 'PARAM_VALUE',
+            'param_id': [0xFF, 0x00, 0x01],
+            'param_value': 1.0,
+        }}))
 
 
 if __name__ == '__main__':
