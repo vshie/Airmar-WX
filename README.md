@@ -102,6 +102,18 @@ Notes:
 
 See [ArduRover Wind Vane docs](https://ardupilot.org/rover/docs/wind-vane.html), [ArduPilot NMEA GPS](https://ardupilot.org/copter/docs/common-gps-how-it-works.html), and [EKF Source Selection](https://ardupilot.org/copter/docs/common-ekf-sources.html) for autopilot-side background.
 
+#### Autopilot addressing (MAV_SYSID)
+
+The extension does **not** assume the autopilot is at MAVLink system 1. It queries `GET /mavlink2rest/mavlink/vehicles` and picks the component whose `HEARTBEAT` reports a real autopilot (`MAV_AUTOPILOT_ARDUPILOTMEGA` or `MAV_AUTOPILOT_PX4`), preferring surface-boat / ground-rover vehicle types when several are visible. BlueOS's own onboard-controller heartbeat and this extension's `NAMED_VALUE_FLOAT` publishers are ignored.
+
+This matters because `MAV_SYSID` (`SYSID_THISMAV` on firmware before 4.6) is operator-settable. On a BlueBoat it is commonly **2**, with system 1 holding only BlueOS's companion-computer heartbeat. Addressing `PARAM_SET` to the wrong system is silently ignored by the autopilot and is indistinguishable from "the parameter does not exist" — the discovered address is logged at startup:
+
+```
+INFO:app:Autopilot discovered at system 2 component 1
+```
+
+Discovery is refreshed at the start of every Apply, and retried automatically if a read stops returning, so changing `MAV_SYSID` and rebooting does not require reinstalling the extension.
+
 ## ArduPilot mavlink2rest NVF Streaming
 
 Independent of the UDP NMEA stream above, the extension also publishes the latest wind values as `NAMED_VALUE_FLOAT` MAVLink messages via the BlueOS mavlink2rest endpoint at 1 Hz. These appear in the autopilot's DataFlash `.BIN` log as `NVF` rows and in the BlueOS MAVLink inspector, side-by-side with `MTK_*` / `ODO_*` etc. from other extensions.

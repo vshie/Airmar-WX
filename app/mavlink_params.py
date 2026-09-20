@@ -130,6 +130,93 @@ def _str_to_chars(param_id: str, pad_len: int = PARAM_ID_LEN) -> List[str]:
     return chars
 
 
+# ── Autopilot discovery ─────────────────────────────────────────────
+#
+# The autopilot is NOT reliably at (system 1, component 1). On the
+# BlueBoat this extension targets, the flight controller answers at
+# **system 2, component 1** (`SYSID_THISMAV = 2`), while system 1 holds
+# only BlueOS's own onboard-controller heartbeat. Hardcoding (1, 1) is
+# what made every apply silently do nothing: PARAM_SET went to a system
+# that no autopilot was listening on, and the PARAM_VALUE mailbox for
+# (1, 1) stayed permanently empty so every read timed out.
+#
+# Verified live against 192.168.1.69:
+#   sys=1 comp=191  MAV_AUTOPILOT_INVALID / MAV_TYPE_ONBOARD_CONTROLLER
+#   sys=2 comp=1    MAV_AUTOPILOT_ARDUPILOTMEGA / MAV_TYPE_SURFACE_BOAT  <- FC
+#
+# So we discover the autopilot from `/mavlink/vehicles` the same way the
+# SubReels_TowFish extension does, and re-discover if it goes away.
+
+# Heartbeats we treat as "this is an autopilot", as opposed to BlueOS
+# companion computers (MAV_AUTOPILOT_INVALID / ONBOARD_CONTROLLER) or
+# GCS nodes on system 255.
+_REAL_AUTOPILOTS = (
+    "MAV_AUTOPILOT_ARDUPILOTMEGA",
+    "MAV_AUTOPILOT_PX4",
+)
+
+# This extension configures a surface vehicle's wind vane + GPS, so when
+# several autopilots are visible on a shared MAVLink network prefer the
+# boat/rover over anything submerged or airborne.
+BOAT_MAVTYPES = (
+    "MAV_TYPE_SURFACE_BOAT",
+    "MAV_TYPE_GROUND_ROVER",
+    "MAV_TYPE_GROUND",
+)
+
+
+def _heartbeat_enum(message: dict, field: str) -> str:
+    """Pull a mavlink2rest enum ``type`` string out of a HEARTBEAT field."""
+    value = message.get(field)
+    if isinstance(value, dict):
+        return str(value.get("type") or "")
+    return str(value or "")
+
+
+def pick_autopilot(vehicles, prefer_mavtypes=None):
+    """Return ``(system_id, component_id)`` of a real autopilot, or None.
+
+    ``vehicles`` is the JSON object from ``GET /mavlink/vehicles``.
+    Companion computers and GCS nodes are ignored. When more than one
+    autopilot is visible, ``prefer_mavtypes`` (e.g. :data:`BOAT_MAVTYPES`)
+    picks the one whose HEARTBEAT.mavtype matches, in listed order.
+    """
+    if not isinstance(vehicles, dict):
+        return None
+    found = []
+    for vid, vehicle in vehicles.items():
+        if not isinstance(vehicle, dict):
+            continue
+        try:
+            sysid = int(vid)
+        except (TypeError, ValueError):
+            continue
+        components = vehicle.get("components") or {}
+        if not isinstance(components, dict):
+            continue
+        for cid, component in components.items():
+            if not isinstance(component, dict):
+                continue
+            try:
+                comp = int(cid)
+            except (TypeError, ValueError):
+                continue
+            heartbeat = (((component.get("messages") or {}).get("HEARTBEAT")
+                          or {}).get("message") or {})
+            if not isinstance(heartbeat, dict):
+                continue
+            if _heartbeat_enum(heartbeat, "autopilot") not in _REAL_AUTOPILOTS:
+                continue
+            found.append((sysid, comp, _heartbeat_enum(heartbeat, "mavtype")))
+    if not found:
+        return None
+    for preferred in tuple(prefer_mavtypes or ()):
+        for sysid, comp, mavtype in found:
+            if mavtype == preferred:
+                return sysid, comp
+    return found[0][0], found[0][1]
+
+
 # ── Setup contract ──────────────────────────────────────────────────
 # Valid SERIALx range on ArduPilot builds we care about. SERIAL0 is the
 # USB console; refusing it prevents accidentally breaking the GCS link.
@@ -231,14 +318,17 @@ class ParamClient:
 
     def __init__(self,
                  base_url: str = DEFAULT_BASE_URL,
-                 target_system: int = 1,
-                 target_component: int = 1,
+                 target_system: Optional[int] = None,
+                 target_component: Optional[int] = None,
                  gcs_system_id: int = 255,
                  gcs_component_id: int = 240,
                  http_timeout_s: float = 2.0) -> None:
         self.base_url = base_url.rstrip("/")
+        # `None` means "discover from /mavlink/vehicles on first use".
+        # Passing explicit values pins the target (used by tests).
         self.target_system = target_system
         self.target_component = target_component
+        self._target_pinned = target_system is not None
         self.gcs_system_id = gcs_system_id
         self.gcs_component_id = gcs_component_id
         self.http_timeout_s = http_timeout_s
@@ -252,6 +342,45 @@ class ParamClient:
         # One-shot INFO log of the first PARAM_VALUE we see, for
         # debuggability if the shape ever changes again.
         self._logged_first_response = False
+
+    # -- autopilot target ------------------------------------------------
+
+    def discover_target(self) -> Optional[Tuple[int, int]]:
+        """Ask mavlink2rest which vehicle/component is the autopilot.
+
+        Returns ``(system_id, component_id)`` or None when the host is
+        down or isn't publishing an autopilot HEARTBEAT.
+        """
+        vehicles = self._get_json("/mavlink/vehicles")
+        if vehicles is None:
+            return None
+        return pick_autopilot(vehicles, prefer_mavtypes=BOAT_MAVTYPES)
+
+    def ensure_target(self, force: bool = False) -> bool:
+        """Resolve the autopilot address, caching the result.
+
+        Returns True when we have a usable (system, component). Callers
+        must invoke this before any PARAM_* traffic — sending to the
+        wrong system is silently ignored by the autopilot and looks
+        exactly like "the parameter doesn't exist".
+        """
+        if self._target_pinned:
+            return self.target_system is not None
+        if not force and self.target_system is not None:
+            return True
+        found = self.discover_target()
+        if found is None:
+            log.warning(
+                "No ArduPilot/PX4 autopilot found via %s/mavlink/vehicles; "
+                "cannot read or write parameters", self.base_url,
+            )
+            return False
+        if (self.target_system, self.target_component) != found:
+            log.info(
+                "Autopilot discovered at system %d component %d", *found,
+            )
+        self.target_system, self.target_component = found
+        return True
 
     # -- low-level HTTP --------------------------------------------------
 
@@ -419,14 +548,31 @@ class ParamClient:
 
     def read(self, param_id: str, timeout_s: float = 3.0) -> Optional[float]:
         """Return the current value of `param_id`, or None on timeout."""
+        if not self.ensure_target():
+            return None
         with self._lock:
             deadline = time.monotonic() + timeout_s
             if not self._request_read(param_id):
                 return None
-            return self._await_param_value(
+            value = self._await_param_value(
                 param_id, deadline, reject_stamp=None,
                 repoke=lambda: self._request_read(param_id),
             )
+        if value is None and not self._target_pinned:
+            # The autopilot may have rebooted with a different system id,
+            # or we cached a stale target. Re-discover once and retry.
+            previous = (self.target_system, self.target_component)
+            if self.ensure_target(force=True) and \
+                    (self.target_system, self.target_component) != previous:
+                with self._lock:
+                    deadline = time.monotonic() + timeout_s
+                    if not self._request_read(param_id):
+                        return None
+                    return self._await_param_value(
+                        param_id, deadline, reject_stamp=None,
+                        repoke=lambda: self._request_read(param_id),
+                    )
+        return value
 
     def write(self, param_id: str, value: float,
               param_type: str = DEFAULT_PARAM_TYPE,
@@ -448,6 +594,9 @@ class ParamClient:
         PARAM_VALUE with the same name can't fool us into declaring
         success on a write that never happened.
         """
+        if not self.ensure_target():
+            return False, "no autopilot found on mavlink2rest", False
+
         message = {
             "type": "PARAM_SET",
             "target_system": self.target_system,
@@ -483,6 +632,8 @@ class ParamClient:
 
     def is_reachable(self, timeout_s: float = 1.5) -> bool:
         """True when the autopilot host answers with a recent HEARTBEAT."""
+        if not self.ensure_target():
+            return False
         try:
             r = self._session.get(
                 f"{self.base_url}/mavlink/vehicles/{self.target_system}"
@@ -551,6 +702,23 @@ class ParamClient:
             reason, resolved_name, available}}.
         """
         out: Dict[str, dict] = {}
+        # Re-discover the autopilot up front rather than trusting a cached
+        # address. The vehicle's MAV_SYSID (SYSID_THISMAV on older
+        # firmware) is operator-settable and changes on reboot after an
+        # edit; a stale target would let every PARAM_SET POST succeed at
+        # the HTTP layer while addressing a system nothing is listening
+        # on — which is exactly the failure this whole module hit.
+        if not self.ensure_target(force=True):
+            reason = 'no ArduPilot/PX4 autopilot found on mavlink2rest'
+            return {
+                name: {
+                    'target': float(target), 'previous': None,
+                    'current': None, 'action': 'failed', 'ok': False,
+                    'reason': reason, 'resolved_name': name,
+                    'available': False,
+                }
+                for name, target in expected.items()
+            }
         for name, target in expected.items():
             row = {
                 'target': float(target),

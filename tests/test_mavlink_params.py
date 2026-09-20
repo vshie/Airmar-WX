@@ -100,6 +100,10 @@ class _FakeClient(mp.ParamClient):
         self.readable = readable
         self.write_fails = set(write_fails or ())
         self.writes = []
+        # Pin a target so apply_expected()'s up-front discovery is a no-op.
+        self.target_system = 2
+        self.target_component = 1
+        self._target_pinned = True
 
     def read(self, name, timeout_s=3.0):
         if not self.readable:
@@ -257,6 +261,126 @@ class DriftTests(unittest.TestCase):
         self.assertIsNone(drift[0]['current'])
 
 
+class AutopilotDiscoveryTests(unittest.TestCase):
+    """The autopilot is NOT reliably at (system 1, component 1).
+
+    Captured live from the BlueBoat at 192.168.1.69 on 2026-09-20:
+      sys=1  comp=191  MAV_AUTOPILOT_INVALID / MAV_TYPE_ONBOARD_CONTROLLER
+      sys=2  comp=1    MAV_AUTOPILOT_ARDUPILOTMEGA / MAV_TYPE_SURFACE_BOAT
+      sys=255 comp=*   this extension's own NAMED_VALUE_FLOAT publishers
+
+    Hardcoding (1, 1) sent every PARAM_SET to a system no autopilot was
+    listening on and left the PARAM_VALUE mailbox for (1, 1) permanently
+    empty — which is exactly why apply appeared to "succeed" while
+    changing nothing, and why reads took forever before timing out.
+    """
+
+    # Trimmed copy of the real /mavlink/vehicles response.
+    REAL_TOPOLOGY = {
+        "255": {"id": 255, "components": {
+            "73": {"id": 73, "messages": {"NAMED_VALUE_FLOAT": {"message": {
+                "type": "NAMED_VALUE_FLOAT", "value": 0.6}}}},
+            "240": {"id": 240, "messages": {"PARAM_SET": {"message": {
+                "type": "PARAM_SET"}}}},
+        }},
+        "2": {"id": 2, "components": {
+            "1": {"id": 1, "messages": {"HEARTBEAT": {"message": {
+                "type": "HEARTBEAT",
+                "autopilot": {"type": "MAV_AUTOPILOT_ARDUPILOTMEGA"},
+                "mavtype": {"type": "MAV_TYPE_SURFACE_BOAT"}}}}},
+            "194": {"id": 194, "messages": {"STATUSTEXT": {"message": {
+                "type": "STATUSTEXT"}}}},
+        }},
+        "1": {"id": 1, "components": {
+            "191": {"id": 191, "messages": {"HEARTBEAT": {"message": {
+                "type": "HEARTBEAT",
+                "autopilot": {"type": "MAV_AUTOPILOT_INVALID"},
+                "mavtype": {"type": "MAV_TYPE_ONBOARD_CONTROLLER"}}}}},
+        }},
+    }
+
+    def test_picks_real_autopilot_not_system_one(self):
+        got = mp.pick_autopilot(self.REAL_TOPOLOGY,
+                                prefer_mavtypes=mp.BOAT_MAVTYPES)
+        self.assertEqual(got, (2, 1),
+                         "must find the ArduPilot FC at sys 2, not sys 1")
+
+    def test_ignores_companion_and_gcs_nodes(self):
+        """BlueOS's onboard controller (sys 1) and our own NVF publisher
+        (sys 255) must never be mistaken for the autopilot."""
+        only_companions = {
+            "1": self.REAL_TOPOLOGY["1"],
+            "255": self.REAL_TOPOLOGY["255"],
+        }
+        self.assertIsNone(mp.pick_autopilot(only_companions))
+
+    def test_prefers_boat_over_other_autopilots(self):
+        topology = dict(self.REAL_TOPOLOGY)
+        topology["3"] = {"id": 3, "components": {"1": {"id": 1, "messages": {
+            "HEARTBEAT": {"message": {
+                "type": "HEARTBEAT",
+                "autopilot": {"type": "MAV_AUTOPILOT_ARDUPILOTMEGA"},
+                "mavtype": {"type": "MAV_TYPE_SUBMARINE"}}}}}}}
+        got = mp.pick_autopilot(topology, prefer_mavtypes=mp.BOAT_MAVTYPES)
+        self.assertEqual(got, (2, 1), "surface boat must win over submarine")
+
+    def test_falls_back_to_any_autopilot_when_no_preference_matches(self):
+        sub_only = {"3": {"id": 3, "components": {"1": {"id": 1, "messages": {
+            "HEARTBEAT": {"message": {
+                "type": "HEARTBEAT",
+                "autopilot": {"type": "MAV_AUTOPILOT_ARDUPILOTMEGA"},
+                "mavtype": {"type": "MAV_TYPE_SUBMARINE"}}}}}}}}
+        self.assertEqual(
+            mp.pick_autopilot(sub_only, prefer_mavtypes=mp.BOAT_MAVTYPES),
+            (3, 1),
+        )
+
+    def test_handles_bare_string_enums(self):
+        """Older mavlink2rest emits enum fields as bare strings rather
+        than {"type": "..."} wrappers."""
+        topology = {"4": {"id": 4, "components": {"1": {"id": 1, "messages": {
+            "HEARTBEAT": {"message": {
+                "type": "HEARTBEAT",
+                "autopilot": "MAV_AUTOPILOT_ARDUPILOTMEGA",
+                "mavtype": "MAV_TYPE_GROUND_ROVER"}}}}}}}
+        self.assertEqual(mp.pick_autopilot(topology), (4, 1))
+
+    def test_junk_input_returns_none(self):
+        self.assertIsNone(mp.pick_autopilot(None))
+        self.assertIsNone(mp.pick_autopilot({}))
+        self.assertIsNone(mp.pick_autopilot({"notanint": {"components": {}}}))
+
+    def test_pinned_target_skips_discovery(self):
+        """Passing explicit ids must pin them (tests rely on this)."""
+        client = mp.ParamClient(base_url='http://fake', target_system=7,
+                                target_component=3)
+        self.assertTrue(client.ensure_target())
+        self.assertEqual((client.target_system, client.target_component), (7, 3))
+
+    def test_apply_reports_failed_when_no_autopilot_visible(self):
+        """If discovery finds nothing, every row must be 'failed' with a
+        clear reason — never a silent success that misleads the user."""
+        class _NoAutopilotClient(mp.ParamClient):
+            def __init__(self):
+                self.base_url = 'http://fake/mavlink2rest'
+                self.target_system = None
+                self.target_component = None
+                self._target_pinned = False
+            def discover_target(self):
+                return None
+
+        client = _NoAutopilotClient()
+        expected = mp.build_expected_params(6, 7, False)
+        result = client.apply_expected(expected)
+        self.assertEqual(set(result), set(expected))
+        for name, row in result.items():
+            self.assertEqual(row['action'], 'failed', name)
+            self.assertFalse(row['ok'], name)
+            self.assertIn('autopilot', row['reason'])
+        # Nothing should be snapshotted from a fully failed apply.
+        self.assertEqual(mp.snapshot_from_apply_result(result), {})
+
+
 class _FakeResponse:
     def __init__(self, status_code=200, text=''):
         self.status_code = status_code
@@ -301,7 +425,10 @@ class Mavlink2RestTransportTests(unittest.TestCase):
     reported "wrote (unverified)" for writes that never went out."""
 
     def _make_client(self, session):
-        client = mp.ParamClient(base_url='http://fake/mavlink2rest')
+        # Pin the target so these tests exercise the transport only;
+        # autopilot discovery has its own test class.
+        client = mp.ParamClient(base_url='http://fake/mavlink2rest',
+                                target_system=1, target_component=1)
         client._session = session
         return client
 
