@@ -1,8 +1,16 @@
-FROM python:3.11-slim-bullseye
+# Debian bookworm (12). Moved off bullseye 2026-09 because the
+# bullseye-security pool started 404-ing point-release .debs during
+# multi-arch builds (libpython3.9-*, curl, libcurl4). bookworm is
+# current-stable, ships the same python3-serial + curl packages, and
+# keeps the image compatible with BlueOS's docker runtime.
+FROM python:3.11-slim-bookworm
 
-# Install minimal system dependencies
-RUN apt-get update && apt-get install -y \
-    python3-serial curl \
+# Install minimal system dependencies. --no-install-recommends keeps the
+# image small; retries + fix-missing make apt tolerant of short-lived
+# mirror hiccups without silently dropping requested packages.
+RUN apt-get update -o Acquire::Retries=3 \
+    && apt-get install -y --no-install-recommends --fix-missing \
+        python3-serial curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
@@ -62,7 +70,7 @@ EXPOSE 8765
 
 # BlueOS extension metadata
 LABEL org.blueos.type="tool"
-LABEL org.blueos.version="1.1.1"
+LABEL org.blueos.version="1.1.2"
 LABEL org.blueos.requirements="core >= 1.1"
 LABEL org.blueos.name="Airmar WX"
 LABEL org.blueos.description="Interface for Airmar WX-series WeatherStations (300WX, 200WX) over NMEA 0183 — live dashboard, ArduPilot UDP, and Cockpit WebSocket output."
@@ -94,7 +102,7 @@ LABEL permissions='\
 # (authors, company, type, readme, links, requirements). Keeping the
 # org.blueos.* duplicates above for backward compatibility with anything
 # that may still expect them.
-LABEL version="1.1.1"
+LABEL version="1.1.2"
 LABEL type="tool"
 LABEL requirements="core >= 1.1"
 
