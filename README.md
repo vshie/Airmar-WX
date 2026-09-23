@@ -51,12 +51,24 @@ When manually installing, paste this into the **Custom settings** field:
       "/usr/blueos/extensions/300WX:/app/logs",
       "/dev:/dev"
     ],
-    "ExtraHosts": ["host.docker.internal:host-gateway"],
     "NetworkMode": "host",
     "Privileged": true
   }
 }
 ```
+
+> **Networking note.** `NetworkMode: host` is required so the two NMEA UDP
+> feeds (`27001` wind, `27002` GPS + heading) can be sent from `127.0.0.1`
+> to the autopilot's `udpin` sockets. The earlier design routed via the
+> docker bridge (`host.docker.internal` / 172.18.0.1); ArduPilot's
+> `UDPDevice::read()` calls `socket.connect()` on the first datagram's
+> source address, which was 192.168.2.12 (the host's LAN address). After
+> that, every subsequent datagram — still addressed to 172.18.0.1 — was
+> silently dropped as "not from the connected peer". Sending from the
+> loopback keeps the source address stable and works because
+> `NetworkMode: host` makes the container share the host's `lo`. The
+> `ExtraHosts` mapping for `host.docker.internal` is no longer required
+> and has been removed.
 
 ## ArduPilot UDP Streaming (dual routes)
 
@@ -65,7 +77,7 @@ The extension forwards NMEA sentences to the autopilot via **two** UDP ports at 
 | Route | UDP port | Sentences | ArduPilot driver |
 |---|---|---|---|
 | Wind    | `27001` | `$WIMWV`                                | `AP_WindVane_NMEA` (`WNDVN_TYPE = 4`) |
-| GPS + heading | `27002` | `$GPGGA`, `$GPRMC`, `$GPVTG`, `$HCHDT` | `AP_GPS` NMEA driver (`GPS1_TYPE = 5`) |
+| GPS + heading | `27002` | `$GPGGA`, `$GPRMC`, `$GPVTG`, `$HCHDT` | `AP_GPS` NMEA driver on **GPS2** (`GPS2_TYPE = 5`); onboard GPS stays on `GPS1_TYPE = 1` (AUTO) |
 
 ### BlueOS serial port configuration (manual)
 
@@ -86,11 +98,20 @@ In **Setup → Step 2b**, pick the two SERIAL indexes you assigned above (e.g. `
 | `WNDVN_TYPE`                 | `4`  | NMEA wind vane |
 | `WNDVN_SPEED_TYPE`           | `4`  | NMEA wind speed (else speed defaults to none) |
 | `SERIAL{Y}_PROTOCOL`         | `5`  | GPS serial → GPS |
-| `GPS1_TYPE` (or `GPS_TYPE`)  | `5`  | NMEA GPS driver. Legacy `GPS_TYPE` used if `GPS1_TYPE` is absent. |
+| `GPS1_TYPE` (or `GPS_TYPE`)  | `1`  | **AUTO** — leaves the BlueBoat's onboard u-Blox on GPS1. Legacy `GPS_TYPE` synonym used if `GPS1_TYPE` is absent. |
+| `GPS2_TYPE`                  | `5`  | NMEA — the Airmar's NMEA-over-UDP stream becomes GPS2. |
 | `EK3_SRC2_YAW`               | `2`  | Alternate EKF source set uses GPS yaw |
 | `EK3_SRC2_POSXY`             | `3`  | Alternate EKF source set uses GPS for horizontal position |
 | `EK3_SRC2_VELXY`             | `3`  | Alternate EKF source set uses GPS for horizontal velocity |
 | `EK3_SRC1_YAW` *(opt-in)*    | `3`  | Optional: promote Airmar HDT to primary yaw source with compass fallback |
+
+> **Why GPS1 stays on AUTO, not NMEA.** ArduPilot's `AUTO` (`1`) probes
+> u-Blox, SBP, SiRF, and ERB, which covers the BlueBoat's stock GPS.
+> `AUTO` explicitly does *not* probe NMEA, so the Airmar must be on
+> `GPS2_TYPE = 5`. Earlier versions of this extension wrote
+> `GPS1_TYPE = 5`, which disabled the onboard GPS; on install of 1.1.6+
+> the persisted `expected` snapshot is migrated to the two-GPS contract
+> and the drift banner surfaces so the operator can re-Apply.
 
 Notes:
 
@@ -98,7 +119,7 @@ Notes:
 - **UDPIN ignores `SERIALx_BAUD`.** The extension does not write baud so a wired UART on the same index is not silently reconfigured.
 - **Missing firmware params are skipped**, not treated as failures — the setup still succeeds on a build without wind-vane support, and the UI reports which rows were unavailable.
 - **The extension does not write the BlueOS serial device string.** That mapping lives in BlueOS, not in ArduPilot parameters — you still paste the two `udpin` strings manually and reboot the autopilot after Save.
-- **Restart the autopilot** after applying parameters that change `SERIALx_PROTOCOL`, `GPS1_TYPE`, or `WNDVN_TYPE` — those are read at boot.
+- **Restart the autopilot** after applying parameters that change `SERIALx_PROTOCOL`, `GPS1_TYPE`, `GPS2_TYPE`, or `WNDVN_TYPE` — those are read at boot.
 
 See [ArduRover Wind Vane docs](https://ardupilot.org/rover/docs/wind-vane.html), [ArduPilot NMEA GPS](https://ardupilot.org/copter/docs/common-gps-how-it-works.html), and [EKF Source Selection](https://ardupilot.org/copter/docs/common-ekf-sources.html) for autopilot-side background.
 

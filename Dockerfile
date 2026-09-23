@@ -70,7 +70,7 @@ EXPOSE 8765
 
 # BlueOS extension metadata
 LABEL org.blueos.type="tool"
-LABEL org.blueos.version="1.1.5"
+LABEL org.blueos.version="1.1.6"
 LABEL org.blueos.requirements="core >= 1.1"
 LABEL org.blueos.name="Airmar WX"
 LABEL org.blueos.description="Interface for Airmar WX-series WeatherStations (300WX, 200WX) over NMEA 0183 — live dashboard, ArduPilot UDP, and Cockpit WebSocket output."
@@ -92,7 +92,6 @@ LABEL permissions='\
       "/usr/blueos/extensions/300WX:/app/logs",\
       "/dev:/dev"\
     ],\
-    "ExtraHosts": ["host.docker.internal:host-gateway"],\
     "NetworkMode": "host",\
     "Privileged": true\
   }\
@@ -102,7 +101,7 @@ LABEL permissions='\
 # (authors, company, type, readme, links, requirements). Keeping the
 # org.blueos.* duplicates above for backward compatibility with anything
 # that may still expect them.
-LABEL version="1.1.5"
+LABEL version="1.1.6"
 LABEL type="tool"
 LABEL requirements="core >= 1.1"
 

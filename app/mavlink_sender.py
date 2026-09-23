@@ -52,10 +52,14 @@ Pattern (mirrors `Mikrotik-Monitor/app/mavlink_sender.py`)
 
 Endpoint discovery
 ------------------
-BlueOS has historically exposed mavlink2rest under several paths:
-  - `http://host.docker.internal/mavlink2rest/mavlink`   (NGINX proxy)
-  - `http://host.docker.internal:6040/v1/mavlink`        (direct, current)
+BlueOS has historically exposed mavlink2rest under several paths. Because
+the container runs with NetworkMode=host, `127.0.0.1` is the host and is
+the preferred address; `host.docker.internal` (docker bridge gateway) is
+kept only as a fallback for older BlueOS builds.
+  - `http://127.0.0.1:6040/v1/mavlink`                   (direct, current)
+  - `http://127.0.0.1/mavlink2rest/mavlink`              (NGINX proxy)
   - `http://192.168.2.2/mavlink2rest/mavlink`            (vehicle IP fallback)
+  - `http://host.docker.internal:6040/v1/mavlink`        (legacy compat)
 We try them on the first POST, cache the first one that returns 2xx, and
 fall back through the list again if the cached one starts failing.
 """
@@ -94,14 +98,18 @@ NAMED_VALUE_OFFSETS = {
 HEADER_SYSTEM_ID = 255  # GCS-style sender, same as Odometer / Mikrotik-Monitor
 
 # Endpoint candidates, in preference order. The first 2xx response wins and is
-# cached for the remainder of the process lifetime.
+# cached for the remainder of the process lifetime. Localhost first because
+# the container runs with NetworkMode=host; `host.docker.internal` is only
+# kept for legacy BlueOS builds where the loopback route may not exist.
 POST_ENDPOINTS = (
-    'http://host.docker.internal:6040/v1/mavlink',
-    'http://host.docker.internal/mavlink2rest/mavlink',
-    'http://192.168.2.2:6040/v1/mavlink',
-    'http://192.168.2.2/mavlink2rest/mavlink',
+    'http://127.0.0.1:6040/v1/mavlink',
+    'http://127.0.0.1/mavlink2rest/mavlink',
     'http://localhost:6040/v1/mavlink',
     'http://localhost/mavlink2rest/mavlink',
+    'http://192.168.2.2:6040/v1/mavlink',
+    'http://192.168.2.2/mavlink2rest/mavlink',
+    'http://host.docker.internal:6040/v1/mavlink',
+    'http://host.docker.internal/mavlink2rest/mavlink',
     'http://blueos.local:6040/v1/mavlink',
     'http://blueos.local/mavlink2rest/mavlink',
 )

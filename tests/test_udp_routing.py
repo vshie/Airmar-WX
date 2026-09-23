@@ -83,7 +83,14 @@ class UdpRoutingTests(unittest.TestCase):
         sent = self.handler.udp_socket.sent
         self.assertEqual(len(sent), 1)
         payload, addr = sent[0]
-        self.assertEqual(addr, ('host.docker.internal', 27001))
+        # Regression: this MUST be 127.0.0.1, not host.docker.internal.
+        # ArduPilot's `udpin` socket connect()s to the sender address on
+        # the first datagram; the docker bridge gateway sender address
+        # (172.18.0.1) was rejected on subsequent datagrams because the
+        # host's LAN address was pinned by connect(). Localhost keeps the
+        # sender address stable and works because the container is
+        # NetworkMode=host. See main.py:UDP_HOST for the full write-up.
+        self.assertEqual(addr, ('127.0.0.1', 27001))
         self.assertTrue(payload.endswith(b'\n'))
         self.assertEqual(self.handler.streamed_wind_messages, 1)
         self.assertEqual(self.handler.streamed_gps_messages, 0)
@@ -93,7 +100,7 @@ class UdpRoutingTests(unittest.TestCase):
         self.handler.stream_message('$GPGGA,...', 'GGA')
         sent = self.handler.udp_socket.sent
         self.assertEqual(len(sent), 1)
-        self.assertEqual(sent[0][1], ('host.docker.internal', 27002))
+        self.assertEqual(sent[0][1], ('127.0.0.1', 27002))
         self.assertEqual(self.handler.streamed_gps_messages, 1)
         self.assertEqual(self.handler.streamed_wind_messages, 0)
 

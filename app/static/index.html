@@ -806,8 +806,11 @@
                         <div class="text-caption grey--text mb-3">
                           Enter the SERIAL numbers you used in step&nbsp;2a. Clicking
                           Apply writes and verifies the matching ArduPilot parameters
-                          via mavlink2rest. If they drift later, this panel offers
-                          Restore or Ignore.
+                          via mavlink2rest. The Airmar is wired as
+                          <code>GPS2_TYPE&nbsp;=&nbsp;5</code>&nbsp;(NMEA); the vehicle's onboard
+                          GPS stays on <code>GPS1_TYPE&nbsp;=&nbsp;1</code>&nbsp;(AUTO) so the
+                          stock u-Blox keeps working. If parameters drift later,
+                          this panel offers Restore or Ignore.
                         </div>
 
                         <v-row dense>

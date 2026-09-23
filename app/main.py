@@ -4,6 +4,7 @@ import os
 import serial
 import serial.tools.list_ports
 import logging
+import logging.handlers
 import json
 import socket
 import asyncio
@@ -76,8 +77,29 @@ class NMEAHandler:
         'ZDA':   {'name': 'Time & Date', 'description': 'UTC time and date', 'default_enabled': False, 'default_interval': 10, 'max_chars': 38},
     }
     
-    # Sentences auto-enabled on connection for dashboard display
-    REQUIRED_SENTENCES = ['MWVR', 'MWVT', 'MWD', 'HDT', 'VTG', 'ROT', 'ZDA']
+    # Sentences auto-enabled on connection. Two groups:
+    #   * Dashboard display (wind + heading + rate-of-turn + time/date).
+    #   * ArduPilot GPS driver (`AP_GPS_NMEA`): GGA, RMC, VTG, HDT. These
+    #     are the sentences the driver actually consumes; without GGA the
+    #     driver reports "no fix" even when position is streaming, and
+    #     without RMC there is no ground-truth speed/course fallback when
+    #     VTG drops. They must also be fast enough that the EKF3 GPS
+    #     branch stays healthy — see `_required_interval_for()`.
+    REQUIRED_SENTENCES = ['MWVR', 'MWVT', 'MWD', 'HDT', 'VTG', 'ROT', 'ZDA',
+                          'GGA', 'RMC']
+
+    # PAMTC,EN interval override for the ArduPilot GPS sentences when we
+    # are at the operating baud (115200). Value is tenths-of-seconds per
+    # the WX manual, so `1` = 0.1 s = 10 Hz. ArduPilot's NMEA GPS driver
+    # is happier at 5-10 Hz (EKF3 innovation rejects sluggish GPS), and
+    # 4 sentences x 82 chars x 10 Hz = ~26 kbps, well under 115200 baud
+    # with the wind + weather sentences at 1 Hz on the same bus.
+    #
+    # At 4800 baud we keep the class-dict default of 10 tenths (1 Hz) to
+    # stay well under the ~4800 chars/s ceiling.
+    HIGH_BAUD_GPS_HZ_OVERRIDE_TENTHS = {
+        'GGA': 1, 'RMC': 1, 'VTG': 1, 'HDT': 1,
+    }
 
     # ── ArduPilot UDP routes ─────────────────────────────────────────
     # Two always-active filtered streams. Each route sends only its own set
@@ -85,14 +107,28 @@ class NMEAHandler:
     # can be bound to each (BlueOS: `udpin:0.0.0.0:<port>` for SERIALx).
     #
     #   Wind route → 27001, drives AP_WindVane_NMEA (WNDVN_TYPE=4)
-    #   GPS route  → 27002, drives AP_GPS NMEA driver (GPS1_TYPE=5) and yaw
+    #   GPS route  → 27002, drives AP_GPS NMEA driver (GPS2_TYPE=5) and yaw
     #
     # Historically this extension picked one mode at a time and shipped
     # everything to port 27000. That prevented feeding both drivers because
     # the wind driver only accepts $??MWV and the GPS driver only accepts
     # GGA/RMC/VTG/HDT. Two ports keep each driver clean and match the
     # per-serial protocol model in ArduPilot (SERIALx_PROTOCOL is one value).
-    UDP_HOST = 'host.docker.internal'
+    #
+    # Host is 127.0.0.1: the container runs with NetworkMode=host, so the
+    # host loopback is the autopilot's `udpin` bind address. Using
+    # `host.docker.internal` (172.18.0.1, the docker bridge gateway) sent
+    # datagrams from 192.168.2.12 (the host's LAN address). ArduPilot's
+    # wildcard `udpin:0.0.0.0:PORT` socket accepts the first datagram, then
+    # `UDPDevice::read()` calls `socket.connect()` on that sender's
+    # (address, port) tuple. That pins the socket's local address to
+    # 192.168.2.12, after which every subsequent datagram -- still
+    # addressed to 172.18.0.1 -- silently no longer matches. ArduPilot
+    # received exactly one datagram per boot and then went deaf, which is
+    # why restarting never helped and the wind feed was silently broken in
+    # the same way. Sending from 127.0.0.1 keeps the source address stable
+    # for the lifetime of the process.
+    UDP_HOST = '127.0.0.1'
     UDP_WIND_PORT = 27001
     UDP_GPS_PORT = 27002
     UDP_WIND_SENTENCES = frozenset({'MWV'})
@@ -348,24 +384,51 @@ class NMEAHandler:
         log_dir = Path(os.environ.get('AIRMAR_WX_LOG_DIR', '/app/logs'))
         log_dir.mkdir(parents=True, exist_ok=True)
         
-        # Set up file handler for NMEA messages
+        # Set up file handler for NMEA messages. Rotating on size so the
+        # log cannot grow unbounded: 10 Hz per GPS sentence x 4 sentences
+        # x ~80 chars = ~3.2 kB/s = ~275 MB/day. Rotating at 25 MB with
+        # 4 backups caps disk use at ~125 MB and keeps ~10 hours of
+        # history at the fast rate.
         self.log_path = log_dir / 'nmea_messages.log'
-        nmea_fh = logging.FileHandler(self.log_path, mode='a')
+        nmea_fh = logging.handlers.RotatingFileHandler(
+            self.log_path, mode='a',
+            maxBytes=25 * 1024 * 1024, backupCount=4,
+        )
         nmea_fh.setLevel(logging.INFO)
         nmea_formatter = logging.Formatter('%(asctime)s - %(message)s')
         nmea_fh.setFormatter(nmea_formatter)
+        # Guard against duplicate handlers when NMEAHandler is
+        # instantiated more than once (test suites, reload). Otherwise
+        # each construction adds another FileHandler and every sentence
+        # gets logged N times.
+        for h in list(self.nmea_logger.handlers):
+            self.nmea_logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
         self.nmea_logger.addHandler(nmea_fh)
         self.nmea_logger.setLevel(logging.INFO)
         # Per-line NMEA must not propagate to the root logger (avoids flooding
         # BlueOS extension / container logs at INFO for every sentence).
         self.nmea_logger.propagate = False
         
-        # Set up file handler for application logs
+        # Set up file handler for application logs. Also rotating so a
+        # noisy warning loop can't fill the disk between restarts.
         app_log_path = log_dir / '300wx.log'
-        app_fh = logging.FileHandler(app_log_path, mode='a')
+        app_fh = logging.handlers.RotatingFileHandler(
+            app_log_path, mode='a',
+            maxBytes=5 * 1024 * 1024, backupCount=3,
+        )
         app_fh.setLevel(logging.INFO)
         app_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         app_fh.setFormatter(app_formatter)
+        for h in list(self.app_logger.handlers):
+            self.app_logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
         self.app_logger.addHandler(app_fh)
         self.app_logger.setLevel(logging.INFO)
 
@@ -422,6 +485,19 @@ class NMEAHandler:
                     del self.state['autopilot_mode']
                 if not isinstance(self.state.get('autopilot_setup'), dict):
                     self.state['autopilot_setup'] = {}
+                # Migration (1.1.6): earlier versions wrote `GPS1_TYPE=5`
+                # (NMEA), which forced the primary GPS driver into NMEA and
+                # disabled the BlueBoat's onboard u-Blox. The new contract
+                # is `GPS1_TYPE=1` (AUTO) + `GPS2_TYPE=5` (NMEA) so the
+                # Airmar becomes GPS2 and the stock GPS keeps working.
+                #
+                # We do NOT silently write parameters at startup — that
+                # would violate the apply-once model. Instead we invalidate
+                # the persisted `expected` snapshot and clear the sticky
+                # `ignore_drift` flag; the next check will then surface a
+                # drift against the correct expectation, and the operator
+                # can hit Restore to apply the new contract, or Ignore.
+                self._migrate_autopilot_setup_gps_contract()
                 self.is_streaming = self.state.get('is_streaming', False)
                 self.app_logger.debug(f"Loaded state: port={self.state['port']}, baud={self.state['baud_rate']}, streaming={self.is_streaming}")
         except Exception as e:
@@ -438,6 +514,59 @@ class NMEAHandler:
             self.app_logger.debug(f"Saved state: port={self.state['port']}, baud={self.state['baud_rate']}")
         except Exception as e:
             self.app_logger.error(f"Error saving state: {e}")
+
+    def _migrate_autopilot_setup_gps_contract(self):
+        """Upgrade pre-1.1.6 autopilot_setup snapshots to the two-GPS contract.
+
+        Old contract wrote `GPS1_TYPE=5` (NMEA) — that forced the primary
+        GPS driver into NMEA and disabled the vehicle's onboard u-Blox.
+        New contract: `GPS1_TYPE=1` (AUTO) so the stock u-Blox keeps
+        working, and `GPS2_TYPE=5` (NMEA) for the Airmar.
+
+        We deliberately do NOT re-POST parameters here — apply-once is a
+        user-triggered action. Instead we:
+          1. Drop the stale `expected` map and `last_apply_result` so the
+             next drift check compares against the new contract, not the
+             old one.
+          2. Clear `ignore_drift` so the operator is notified once and can
+             re-click Apply (or Ignore) with the corrected expectations.
+          3. Keep `wind_serial`, `gps_serial`, and `use_gps_yaw_fallback`
+             so the UI form comes up pre-populated with the previous
+             selection.
+        """
+        setup = self.state.get('autopilot_setup')
+        if not isinstance(setup, dict):
+            return
+        expected = setup.get('expected')
+        if not isinstance(expected, dict):
+            return
+        # Two signals of the legacy contract: GPS1_TYPE explicitly set to
+        # NMEA (5), OR GPS2_TYPE simply missing while a full apply was
+        # persisted. Either one means "regenerate on next apply".
+        legacy_gps1_nmea = expected.get('GPS1_TYPE') == 5.0
+        missing_gps2 = 'GPS2_TYPE' not in expected
+        if not (legacy_gps1_nmea or missing_gps2):
+            return
+        self.app_logger.info(
+            "Migrating autopilot_setup to two-GPS contract "
+            "(GPS1_TYPE=1 AUTO, GPS2_TYPE=5 NMEA). "
+            "Previous expected snapshot dropped; next check will show "
+            "drift so operator can re-Apply."
+        )
+        setup['expected'] = {}
+        setup['last_apply_result'] = {}
+        setup['last_apply_ts'] = None
+        setup['applied'] = False
+        setup['ignore_drift'] = False
+        # Save immediately so a crash between here and the next save
+        # doesn't leave a half-migrated state.json.
+        try:
+            with open(self.state_path, 'w') as f:
+                json.dump(self.state, f)
+        except Exception as e:
+            self.app_logger.warning(
+                "Migration save failed (will retry on next save): %s", e,
+            )
 
     def _set_conn_status(self, status, message=''):
         """Update connection status with timestamp."""
@@ -1844,11 +1973,32 @@ class NMEAHandler:
             self.app_logger.error(f"Error switching baud rate: {e}")
             return False, str(e)
 
+    def _required_interval_for(self, sentence_id, baud_rate):
+        """Return the PAMTC,EN interval (tenths-of-seconds) for one sentence.
+
+        At the operating baud (115200), GPS sentences that feed the
+        ArduPilot NMEA GPS driver are stepped up to 10 Hz so EKF3's GPS
+        source stays responsive. Everything else uses the class-dict
+        `default_interval` (1 Hz). At 4800 baud all sentences fall back
+        to 1 Hz to stay under the bus ceiling.
+        """
+        config = self.SUPPORTED_SENTENCES.get(sentence_id, {})
+        default_tenths = int(config.get('default_interval', 10))
+        if baud_rate == self.OPERATING_BAUD_RATE:
+            override = self.HIGH_BAUD_GPS_HZ_OVERRIDE_TENTHS.get(sentence_id)
+            if override is not None:
+                return int(override)
+        return default_tenths
+
     def enable_required_sentences(self):
         """
-        Enable the NMEA sentences required for dashboard display.
-        Should only be called when connected at operating baud (115200) unless staying at 4800.
-        Always enables periodic transmission first in case the device was previously stopped.
+        Enable the NMEA sentences required for dashboard display and for
+        ArduPilot GPS ingestion. Called after connect at either 4800 or
+        115200 baud. Always enables periodic transmission first in case
+        the device was previously stopped. Saved per-sentence overrides
+        (from `state.json:sentence_config`) are applied AFTER this call
+        by the connect path, so explicit user settings take precedence.
+
         Returns (success, message)
         """
         try:
@@ -1863,18 +2013,32 @@ class NMEAHandler:
             self.serial_connection.write(self._nmea_cmd('PAMTX,1'))
             time.sleep(0.3)
 
+            baud = self.serial_connection.baudrate
             enabled_count = 0
+            fast_ids = []
             for sentence_id in self.REQUIRED_SENTENCES:
-                config = self.SUPPORTED_SENTENCES.get(sentence_id, {})
-                interval = config.get('default_interval', 10)
-
+                interval = self._required_interval_for(sentence_id, baud)
                 cmd = self._nmea_cmd(f'PAMTC,EN,{sentence_id},1,{interval}')
-                self.app_logger.debug(f"Enabling sentence {sentence_id}")
+                self.app_logger.debug(
+                    "Enabling sentence %s at %d/10 s (%.1f Hz)",
+                    sentence_id, interval, 10.0 / max(interval, 1),
+                )
                 self.serial_connection.write(cmd)
                 time.sleep(0.2)
                 enabled_count += 1
+                if interval == 1:
+                    fast_ids.append(sentence_id)
 
-            self.app_logger.info(f"Enabled {enabled_count} required sentences")
+            if fast_ids:
+                self.app_logger.info(
+                    "Enabled %d required sentences (10 Hz: %s @ %d baud)",
+                    enabled_count, ",".join(sorted(fast_ids)), baud,
+                )
+            else:
+                self.app_logger.info(
+                    "Enabled %d required sentences at 1 Hz (@ %d baud)",
+                    enabled_count, baud,
+                )
             return True, f"Enabled {enabled_count} sentences"
             
         except Exception as e:
@@ -2134,7 +2298,14 @@ class NMEAHandler:
                         continue
                     if line.startswith('$PAMTR,EN,'):
                         # Parse: $PAMTR,EN,<total>,<num>,<id>,<enabled>,<interval> or $PAMTR,EN,<id>,<enabled>,<interval>
-                        parts = line.split(',')
+                        # Strip the NMEA `*XX` checksum first — otherwise
+                        # the last field arrives as e.g. `1*45`, `isdigit()`
+                        # returns False, and every interval silently
+                        # defaults to 10 (1 Hz). This mis-reported 10 Hz
+                        # sentences as 1 Hz in the UI even though the
+                        # device was already running at the higher rate.
+                        line_body = line.split('*', 1)[0]
+                        parts = line_body.split(',')
                         if len(parts) >= 6:
                             # If 7+ parts: total,num,id,enabled,interval at 2,3,4,5,6
                             if len(parts) >= 7 and parts[4] in self.SUPPORTED_SENTENCES:
@@ -2142,6 +2313,7 @@ class NMEAHandler:
                             else:
                                 sentence_id, enabled_str, interval_str = parts[3], parts[4], parts[5]
                             enabled = enabled_str == '1'
+                            interval_str = interval_str.strip()
                             interval = int(interval_str) if interval_str.isdigit() else 10
                             if sentence_id in self.SUPPORTED_SENTENCES:
                                 config[sentence_id] = {'enabled': enabled, 'interval': interval}
@@ -2440,18 +2612,20 @@ class NMEAHandler:
         }
 
     def log_message(self, message):
-        """Log NMEA message"""
+        """Log one NMEA sentence to the rotating NMEA log.
+
+        Previously this wrote the message twice: once directly to
+        `self.log_path` with a manually-formatted timestamp, and once via
+        `self.nmea_logger.info(message)`, whose FileHandler wrote to the
+        same file. The result was every sentence appearing twice in
+        `nmea_messages.log` — visible in the live vehicle output — and
+        also broke rotation: when the rotator truncated the file, the
+        direct `open('a')` call kept appending to the same inode after
+        the rename, silently defeating the size cap.
+
+        The rotating handler (see `__init__`) is now the sole writer.
+        """
         try:
-            # Ensure the log file exists
-            if not self.log_path.exists():
-                self.log_path.touch()
-            
-            # Write the message with timestamp
-            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            with open(self.log_path, 'a') as f:
-                f.write(f"{timestamp} - {message}\n")
-            
-            # Also log to NMEA logger
             self.nmea_logger.info(message)
             return True, "Message logged"
         except Exception as e:

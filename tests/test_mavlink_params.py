@@ -54,14 +54,35 @@ class ExpectedParamsTests(unittest.TestCase):
         # Wind vane both direction + speed types.
         self.assertEqual(exp['WNDVN_TYPE'], float(mp.WNDVN_TYPE_NMEA))
         self.assertEqual(exp['WNDVN_SPEED_TYPE'], float(mp.WNDVN_TYPE_NMEA))
-        # NMEA GPS driver.
-        self.assertEqual(exp['GPS1_TYPE'], float(mp.GPS_TYPE_NMEA))
+        # Two-GPS contract (1.1.6+): onboard u-Blox stays on AUTO,
+        # Airmar becomes GPS2 on NMEA. The old contract wrote
+        # `GPS1_TYPE=5` which disabled the onboard GPS; regression
+        # guard is below.
+        self.assertEqual(exp['GPS1_TYPE'], float(mp.GPS_TYPE_AUTO))
+        self.assertEqual(exp['GPS1_TYPE'], 1.0)
+        self.assertEqual(exp['GPS2_TYPE'], float(mp.GPS_TYPE_NMEA))
+        self.assertEqual(exp['GPS2_TYPE'], 5.0)
         # SRC2 must be a complete set: yaw + posxy + velxy.
         self.assertEqual(exp['EK3_SRC2_YAW'], float(mp.EK3_YAW_GPS))
         self.assertEqual(exp['EK3_SRC2_POSXY'], float(mp.EK3_POSXY_GPS))
         self.assertEqual(exp['EK3_SRC2_VELXY'], float(mp.EK3_VELXY_GPS))
         # SRC1_YAW must NOT be touched by default (compass).
         self.assertNotIn('EK3_SRC1_YAW', exp)
+
+    def test_gps1_type_is_auto_not_nmea(self):
+        """Regression for the 'onboard u-Blox got disabled' bug.
+
+        Pre-1.1.6 the extension wrote GPS1_TYPE=5 (NMEA), which forced
+        the primary GPS driver to NMEA and stopped the BlueBoat's stock
+        u-Blox from being probed at all. GPS1 must be AUTO (1); the
+        Airmar NMEA feed goes on GPS2.
+        """
+        exp = mp.build_expected_params(2, 3)
+        self.assertNotEqual(
+            exp['GPS1_TYPE'], float(mp.GPS_TYPE_NMEA),
+            "GPS1_TYPE must not be NMEA — that disables the onboard GPS",
+        )
+        self.assertEqual(exp['GPS1_TYPE'], 1.0)
 
     def test_opt_in_gps_yaw_fallback_adds_src1_yaw(self):
         exp = mp.build_expected_params(2, 3, use_gps_yaw_fallback=True)
@@ -124,11 +145,13 @@ class _FakeClient(mp.ParamClient):
 class ApplyExpectedTests(unittest.TestCase):
     def test_apply_wrote_and_noop(self):
         # Autopilot already has SERIAL2_PROTOCOL=21 (noop). GPS_TYPE
-        # (legacy) resolves as a synonym for GPS1_TYPE.
+        # (legacy) resolves as a synonym for GPS1_TYPE, and its target
+        # is now 1 (AUTO), not 5 (NMEA).
         client = _FakeClient({
             'SERIAL2_PROTOCOL': 21.0,
             'SERIAL3_PROTOCOL': 0.0,
             'GPS_TYPE': 0.0,          # legacy alias present, GPS1_TYPE not
+            'GPS2_TYPE': 0.0,
             'EK3_SRC2_YAW': 1.0,
             'EK3_SRC2_POSXY': 0.0,
             'EK3_SRC2_VELXY': 0.0,
@@ -144,9 +167,15 @@ class ApplyExpectedTests(unittest.TestCase):
         self.assertEqual(result['SERIAL3_PROTOCOL']['action'], 'wrote')
         self.assertTrue(result['SERIAL3_PROTOCOL']['ok'])
 
-        # GPS1_TYPE resolves to legacy GPS_TYPE and gets written.
+        # GPS1_TYPE resolves to legacy GPS_TYPE and gets written with
+        # AUTO (1), which is what our fake FC records under that alias.
         self.assertEqual(result['GPS1_TYPE']['resolved_name'], 'GPS_TYPE')
         self.assertEqual(result['GPS1_TYPE']['action'], 'wrote')
+        self.assertEqual(client.existing['GPS_TYPE'], 1.0)
+
+        # GPS2_TYPE has no synonym; written directly.
+        self.assertEqual(result['GPS2_TYPE']['action'], 'wrote')
+        self.assertEqual(client.existing['GPS2_TYPE'], 5.0)
 
         self.assertEqual(result['WNDVN_TYPE']['action'], 'wrote')
         self.assertTrue(result['WNDVN_TYPE']['ok'])
@@ -160,7 +189,8 @@ class ApplyExpectedTests(unittest.TestCase):
             # These exist on the FC but reads all fail (readable=False).
             'SERIAL7_PROTOCOL': 0.0, 'SERIAL8_PROTOCOL': 0.0,
             'WNDVN_TYPE': 0.0, 'WNDVN_SPEED_TYPE': 0.0,
-            'GPS1_TYPE': 0.0, 'EK3_SRC2_YAW': 0.0,
+            'GPS1_TYPE': 0.0, 'GPS2_TYPE': 0.0,
+            'EK3_SRC2_YAW': 0.0,
             'EK3_SRC2_POSXY': 0.0, 'EK3_SRC2_VELXY': 0.0,
         }, readable=False)
         exp = mp.build_expected_params(7, 8, False)
@@ -184,7 +214,8 @@ class ApplyExpectedTests(unittest.TestCase):
         client = _FakeClient(
             existing={'SERIAL2_PROTOCOL': 0.0, 'SERIAL3_PROTOCOL': 0.0,
                       'WNDVN_TYPE': 0.0, 'WNDVN_SPEED_TYPE': 0.0,
-                      'GPS1_TYPE': 0.0, 'EK3_SRC2_YAW': 0.0,
+                      'GPS1_TYPE': 0.0, 'GPS2_TYPE': 0.0,
+                      'EK3_SRC2_YAW': 0.0,
                       'EK3_SRC2_POSXY': 0.0, 'EK3_SRC2_VELXY': 0.0},
             write_fails={'WNDVN_TYPE'},
         )
@@ -201,7 +232,8 @@ class ApplyExpectedTests(unittest.TestCase):
         client = _FakeClient(existing={
             'SERIAL2_PROTOCOL': 0.0, 'SERIAL3_PROTOCOL': 0.0,
             'WNDVN_TYPE': 0.0, 'WNDVN_SPEED_TYPE': 0.0,
-            'GPS1_TYPE': 0.0, 'EK3_SRC2_YAW': 0.0,
+            'GPS1_TYPE': 0.0, 'GPS2_TYPE': 0.0,
+            'EK3_SRC2_YAW': 0.0,
             'EK3_SRC2_POSXY': 0.0, 'EK3_SRC2_VELXY': 0.0,
         }, readable=False)
         exp = mp.build_expected_params(2, 3, False)
@@ -215,7 +247,8 @@ class ApplyExpectedTests(unittest.TestCase):
         client = _FakeClient(
             existing={'SERIAL2_PROTOCOL': 0.0, 'SERIAL3_PROTOCOL': 0.0,
                       'WNDVN_TYPE': 0.0, 'WNDVN_SPEED_TYPE': 0.0,
-                      'GPS1_TYPE': 0.0, 'EK3_SRC2_YAW': 0.0,
+                      'GPS1_TYPE': 0.0, 'GPS2_TYPE': 0.0,
+                      'EK3_SRC2_YAW': 0.0,
                       'EK3_SRC2_POSXY': 0.0, 'EK3_SRC2_VELXY': 0.0},
             write_fails={'WNDVN_TYPE'},
         )
@@ -391,8 +424,8 @@ class _FakeSession:
     """Records POSTs / GETs and returns canned responses per URL suffix.
 
     Suffix-match keys keep the tests readable — the real base URL
-    (`http://host.docker.internal/mavlink2rest`) can be anything as long
-    as the endpoint paths are correct.
+    (`http://127.0.0.1/mavlink2rest`) can be anything as long as the
+    endpoint paths are correct.
     """
 
     def __init__(self, get_responses=None, post_responses=None):

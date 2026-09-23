@@ -31,10 +31,12 @@ Wind serial X:
     WNDVN_TYPE         = 4   (NMEA)
     WNDVN_SPEED_TYPE   = 4   (NMEA; without this, speed defaults to none)
 
-GPS serial Y:
+GPS serial Y (Airmar → GPS2, leaves onboard u-Blox as GPS1):
     SERIAL{Y}_PROTOCOL = 5   (GPS)
-    GPS1_TYPE          = 5   (NMEA) — falls back to legacy GPS_TYPE if the
-                                     firmware still ships the pre-multi-GPS name
+    GPS1_TYPE          = 1   (AUTO) — probes u-Blox on the vehicle's stock
+                                     GPS; also falls back to legacy
+                                     `GPS_TYPE` on pre-multi-GPS firmwares
+    GPS2_TYPE          = 5   (NMEA) — the Airmar's UDP feed
 
 Secondary EKF source set (default): use the Airmar GPS + HDT as a complete
 alternate source that a Lua script or aux switch can promote later. Not
@@ -81,11 +83,14 @@ log = logging.getLogger('app')
 
 
 # ── mavlink2rest transport ───────────────────────────────────────────
-# BlueOS proxies mavlink2rest at `/mavlink2rest/` on the host. This is the
-# same endpoint the SubReels_TowFish extension has used in production for
-# months, so we stick to it for the parameter path. `mavlink_sender.py`
-# already tries a broader list for NAMED_VALUE_FLOAT publishes.
-DEFAULT_BASE_URL = "http://host.docker.internal/mavlink2rest"
+# BlueOS proxies mavlink2rest at `/mavlink2rest/` on the host. Because the
+# container runs with NetworkMode=host, `127.0.0.1` is the host itself and
+# is the same address the autopilot sees. Using `host.docker.internal`
+# (172.18.0.1, the docker bridge gateway) worked for GET but caused the
+# UDP feeds to break -- see the long comment in `main.py:UDP_HOST` -- so
+# we standardize the entire extension on localhost. `mavlink_sender.py`
+# still tries a broader endpoint list for NAMED_VALUE_FLOAT publishes.
+DEFAULT_BASE_URL = "http://127.0.0.1/mavlink2rest"
 
 # 16-byte NUL-padded char array (per MAVLink spec) for PARAM_SET and
 # PARAM_REQUEST_READ.
@@ -230,6 +235,13 @@ SERIAL_PROTOCOL_WINDVANE = 21
 # NMEA driver "type" for the WindVane and GPS libraries.
 WNDVN_TYPE_NMEA = 4
 GPS_TYPE_NMEA = 5
+# ArduPilot AP_GPS enum: 0=None, 1=AUTO, 2=uBlox, 5=NMEA (see AP_GPS.h).
+# `AUTO` probes u-Blox / SBP / SiRF / ERB but explicitly does NOT probe
+# NMEA, so an NMEA receiver must use `5`. The BlueBoat's onboard GPS is a
+# u-Blox that AUTO detects; we leave GPS1 on AUTO and put the Airmar NMEA
+# feed on GPS2 so both drivers work simultaneously without disturbing the
+# vehicle's stock GPS wiring.
+GPS_TYPE_AUTO = 1
 
 # EKF3 source enums (see AP_NavEKF_Source).
 EK3_YAW_GPS = 2
@@ -259,15 +271,30 @@ def validate_selection(wind_serial: Optional[int],
 def build_expected_params(wind_serial: int,
                           gps_serial: int,
                           use_gps_yaw_fallback: bool = False) -> Dict[str, float]:
-    """Return the {param_name: value} we want ArduPilot to end up with."""
+    """Return the {param_name: value} we want ArduPilot to end up with.
+
+    GPS contract (as of 1.1.6):
+    * `GPS1_TYPE = 1` (AUTO) — leave the BlueBoat's onboard u-Blox as
+      GPS1. AUTO detects u-Blox / SBP / SiRF / ERB, which covers the
+      stock hardware. We do NOT force NMEA on GPS1 because that would
+      break the vehicle's built-in receiver.
+    * `GPS2_TYPE = 5` (NMEA) — this is the Airmar. The extension only
+      writes GPS2; the operator wires the Airmar's UDP stream to the
+      autopilot's `SERIAL{gps_serial}` slot via BlueOS.
+
+    Earlier versions wrote `GPS1_TYPE = 5`, which forced the primary GPS
+    driver into NMEA mode and disabled the onboard u-Blox. Migration in
+    `main.py` upgrades old persisted `autopilot_setup` snapshots.
+    """
     exp: Dict[str, float] = {
         # Wind serial X
         f'SERIAL{wind_serial}_PROTOCOL': float(SERIAL_PROTOCOL_WINDVANE),
         'WNDVN_TYPE': float(WNDVN_TYPE_NMEA),
         'WNDVN_SPEED_TYPE': float(WNDVN_TYPE_NMEA),
-        # GPS serial Y
+        # GPS serial Y (Airmar → GPS2)
         f'SERIAL{gps_serial}_PROTOCOL': float(SERIAL_PROTOCOL_GPS),
-        'GPS1_TYPE': float(GPS_TYPE_NMEA),
+        'GPS1_TYPE': float(GPS_TYPE_AUTO),
+        'GPS2_TYPE': float(GPS_TYPE_NMEA),
         # Secondary EKF source set — full alternate GPS-yaw set
         'EK3_SRC2_YAW': float(EK3_YAW_GPS),
         'EK3_SRC2_POSXY': float(EK3_POSXY_GPS),
@@ -281,9 +308,10 @@ def build_expected_params(wind_serial: int,
 def _param_synonyms(name: str) -> List[str]:
     """Return acceptable aliases for a canonical param name.
 
-    Currently only `GPS1_TYPE` has a legacy alias (`GPS_TYPE`, pre-multi-GPS
-    firmwares). Return the canonical name first so callers write to the
-    modern name when both exist.
+    Only `GPS1_TYPE` has a legacy alias (`GPS_TYPE`, on pre-multi-GPS
+    firmwares that never gained the numbered variant). `GPS2_TYPE` has no
+    legacy alias: firmwares old enough to lack numbered GPS params also
+    lacked a second GPS instance entirely.
     """
     if name == 'GPS1_TYPE':
         return ['GPS1_TYPE', 'GPS_TYPE']
@@ -836,6 +864,7 @@ __all__ = [
     'SERIAL_PROTOCOL_WINDVANE',
     'WNDVN_TYPE_NMEA',
     'GPS_TYPE_NMEA',
+    'GPS_TYPE_AUTO',
     'EK3_YAW_GPS',
     'EK3_YAW_GPS_WITH_COMPASS_FALLBACK',
     'EK3_POSXY_GPS',
