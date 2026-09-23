@@ -69,6 +69,13 @@ When manually installing, paste this into the **Custom settings** field:
 > `NetworkMode: host` makes the container share the host's `lo`. The
 > `ExtraHosts` mapping for `host.docker.internal` is no longer required
 > and has been removed.
+>
+> ArduPilot pins the sender's UDP source **port** as well as its address.
+> The extension therefore binds its sender to the fixed endpoint
+> `127.0.0.1:27100`; both destination routes use that source. This keeps
+> wind and GPS working across extension-only restarts instead of changing
+> to a new ephemeral source port. After upgrading from 1.1.6 or earlier,
+> restart the autopilot once to clear its previously pinned peer.
 
 ## ArduPilot UDP Streaming (dual routes)
 
@@ -86,7 +93,7 @@ Open **BlueOS → Autopilot Firmware → Serial port configuration** and set two
 - `udpin:0.0.0.0:27001` — the SERIAL port that will act as the wind vane
 - `udpin:0.0.0.0:27002` — the SERIAL port that will act as the GPS/heading source
 
-Do NOT use the same serial index for both, and do NOT overwrite the on-board GPS serial. The extension surfaces both strings with a click-to-copy button on the **Sentences** tab (next to a screenshot of the serial-config page).
+Do NOT use the same serial index for both, and do NOT overwrite the on-board GPS serial. The extension surfaces both strings with a click-to-copy button under **Setup → Step 2a** next to the serial-config screenshot.
 
 ### ArduRover parameter setup (from the extension)
 

@@ -13,8 +13,8 @@ that card (per user request the tab is image-led with no prose).
 Screenshot of BlueOS **Autopilot Firmware → Serial port configuration**
 with two serial slots set to:
 
-- `udpin:0.0.0.0:27001` (wind serial)
-- `udpin:0.0.0.0:27002` (GPS/heading serial)
+- Serial 6: `udpin:0.0.0.0:27001` (wind)
+- Serial 7: `udpin:0.0.0.0:27002` (GPS/heading)
 
 Rendered under **Setup → Step 2a** next to the copyable `udpin` strings.
 If the file is missing, the UI falls back to text guidance automatically.

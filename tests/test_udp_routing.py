@@ -56,6 +56,10 @@ class _FakeSocket:
     def __init__(self):
         self.sent = []
         self.closed = False
+        self.bound = None
+
+    def bind(self, addr):
+        self.bound = addr
 
     def sendto(self, data, addr):
         self.sent.append((data, addr))
@@ -152,6 +156,33 @@ class UdpRoutingTests(unittest.TestCase):
         self.assertEqual(sorted(by_name['wind']['sentences']), ['MWV'])
         self.assertEqual(sorted(by_name['gps']['sentences']),
                          ['GGA', 'HDT', 'RMC', 'VTG'])
+        self.assertEqual(by_name['wind']['source_endpoint'],
+                         '127.0.0.1:27100')
+        self.assertEqual(by_name['gps']['source_endpoint'],
+                         '127.0.0.1:27100')
+
+    def test_udp_sender_binds_stable_source_port(self):
+        """ArduPilot pins both source IP and source port after the first
+        datagram. A new ephemeral port after an extension restart would
+        leave both udpin receivers connected to the dead process."""
+        fake = _FakeSocket()
+        with mock.patch.object(self.main.socket, 'socket',
+                               return_value=fake):
+            created = self.handler._create_udp_socket()
+        self.assertIs(created, fake)
+        self.assertEqual(fake.bound, ('127.0.0.1', 27100))
+
+    def test_udp_bind_failure_closes_socket(self):
+        class _FailingBindSocket(_FakeSocket):
+            def bind(self, addr):
+                raise OSError('source port already in use')
+
+        fake = _FailingBindSocket()
+        with mock.patch.object(self.main.socket, 'socket',
+                               return_value=fake):
+            with self.assertRaises(OSError):
+                self.handler._create_udp_socket()
+        self.assertTrue(fake.closed)
 
     def test_status_snapshot_has_no_legacy_mode_key(self):
         snap = self.handler._stream_status_snapshot()

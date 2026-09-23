@@ -126,9 +126,14 @@ class NMEAHandler:
     # addressed to 172.18.0.1 -- silently no longer matches. ArduPilot
     # received exactly one datagram per boot and then went deaf, which is
     # why restarting never helped and the wind feed was silently broken in
-    # the same way. Sending from 127.0.0.1 keeps the source address stable
-    # for the lifetime of the process.
+    # the same way. Sending from 127.0.0.1 keeps the source address stable.
+    #
+    # UDPDevice also pins the sender's source *port*. An unbound socket gets
+    # a new ephemeral port after every extension restart, leaving ArduPilot
+    # connected to a dead process. Bind one fixed source endpoint for both
+    # routes so extension-only restarts do not break either feed.
     UDP_HOST = '127.0.0.1'
+    UDP_SOURCE_PORT = 27100
     UDP_WIND_PORT = 27001
     UDP_GPS_PORT = 27002
     UDP_WIND_SENTENCES = frozenset({'MWV'})
@@ -1231,7 +1236,7 @@ class NMEAHandler:
         """
         try:
             if not self.udp_socket:
-                self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.udp_socket = self._create_udp_socket()
             if not self.is_streaming:
                 # Reset counters only when actually starting so a re-toggle
                 # after a stop starts fresh, but redundant `start` calls do
@@ -1243,7 +1248,9 @@ class NMEAHandler:
             self.state['is_streaming'] = True
             self.save_state()
             self.app_logger.info(
-                "UDP streaming started — wind %s → %s:%d, gps %s → %s:%d",
+                "UDP streaming started — source %s:%d; "
+                "wind %s → %s:%d, gps %s → %s:%d",
+                self.UDP_HOST, self.UDP_SOURCE_PORT,
                 sorted(self.UDP_WIND_SENTENCES), self.UDP_HOST, self.UDP_WIND_PORT,
                 sorted(self.UDP_GPS_SENTENCES), self.UDP_HOST, self.UDP_GPS_PORT,
             )
@@ -1251,6 +1258,16 @@ class NMEAHandler:
         except Exception as e:
             self.app_logger.error(f"Error starting UDP stream: {e}")
             return False, str(e)
+
+    def _create_udp_socket(self):
+        """Create a sender bound to ArduPilot's stable peer endpoint."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind((self.UDP_HOST, self.UDP_SOURCE_PORT))
+        except Exception:
+            sock.close()
+            raise
+        return sock
 
     def stop_streaming(self):
         """Stop UDP streaming"""
@@ -1293,6 +1310,7 @@ class NMEAHandler:
                 'host': self.UDP_HOST,
                 'port': self.UDP_WIND_PORT,
                 'endpoint': f'{self.UDP_HOST}:{self.UDP_WIND_PORT}',
+                'source_endpoint': f'{self.UDP_HOST}:{self.UDP_SOURCE_PORT}',
                 'streamed_messages': self.streamed_wind_messages,
             },
             {
@@ -1301,6 +1319,7 @@ class NMEAHandler:
                 'host': self.UDP_HOST,
                 'port': self.UDP_GPS_PORT,
                 'endpoint': f'{self.UDP_HOST}:{self.UDP_GPS_PORT}',
+                'source_endpoint': f'{self.UDP_HOST}:{self.UDP_SOURCE_PORT}',
                 'streamed_messages': self.streamed_gps_messages,
             },
         ]
@@ -1616,8 +1635,11 @@ class NMEAHandler:
         port, counter_attr = route
         try:
             if not self.udp_socket:
-                self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                self.app_logger.debug("Created new UDP socket")
+                self.udp_socket = self._create_udp_socket()
+                self.app_logger.debug(
+                    "Created UDP socket bound to %s:%d",
+                    self.UDP_HOST, self.UDP_SOURCE_PORT,
+                )
 
             encoded_message = (message + '\n').encode()
             self.udp_socket.sendto(encoded_message, (self.UDP_HOST, port))
@@ -1628,7 +1650,7 @@ class NMEAHandler:
             try:
                 if self.udp_socket:
                     self.udp_socket.close()
-                self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.udp_socket = self._create_udp_socket()
             except Exception as socket_error:
                 self.app_logger.error(f"Failed to recreate socket: {socket_error}")
 
