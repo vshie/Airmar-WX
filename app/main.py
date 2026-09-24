@@ -139,6 +139,17 @@ class NMEAHandler:
     UDP_WIND_SENTENCES = frozenset({'MWV'})
     UDP_GPS_SENTENCES = frozenset({'GGA', 'RMC', 'VTG', 'HDT'})
 
+    # ArduPilot's AP_GPS NMEA driver writes auto-detect / baud-probe
+    # strings ($PUBX, $PSRF100, "CONFIG COM1 230400 8 n 1", ...) back to
+    # whichever peer its `udpin` socket connected to -- which is now our
+    # fixed sender at UDP_SOURCE_PORT. We have no use for them, but an
+    # unread socket accumulates them until the kernel receive buffer
+    # fills and starts dropping. That costs us nothing (UDP gives the
+    # sender no backpressure), so this drain keeps the socket tidy rather
+    # than preventing a failure.
+    UDP_DRAIN_INTERVAL_S = 1.0
+    UDP_DRAIN_MAX_DATAGRAMS = 32
+
     # After probe at 4800, switch to this rate (300WX supports up to 115200 via $PAMTC,BAUD).
     OPERATING_BAUD_RATE = 115200
 
@@ -196,6 +207,7 @@ class NMEAHandler:
         self.log_path = None
         self.state_path = None
         self.udp_socket = None
+        self._last_udp_drain_ts = 0.0
         self.is_streaming = False
         # Per-route counters. `streamed_messages` remains as a legacy total
         # (wind + gps) so existing callers keep working.
@@ -1269,6 +1281,34 @@ class NMEAHandler:
             raise
         return sock
 
+    def _maybe_drain_udp_socket(self):
+        """Discard ArduPilot's replies to our sender socket, ~1/s.
+
+        Throttled because the send path runs at ~40 Hz and the probe
+        traffic is far slower than that. Uses MSG_DONTWAIT per-call
+        rather than putting the socket in non-blocking mode, so `sendto`
+        keeps its normal blocking semantics and can't start raising
+        EAGAIN into the error path below.
+        """
+        sock = self.udp_socket
+        if sock is None:
+            return
+        now = time.monotonic()
+        if now - self._last_udp_drain_ts < self.UDP_DRAIN_INTERVAL_S:
+            return
+        self._last_udp_drain_ts = now
+        # Bounded so a burst can't stall the serial reader thread.
+        for _ in range(self.UDP_DRAIN_MAX_DATAGRAMS):
+            try:
+                if not sock.recv(4096, socket.MSG_DONTWAIT):
+                    return
+            except (BlockingIOError, InterruptedError):
+                return      # nothing left to read
+            except OSError:
+                return      # socket torn down underneath us
+            except AttributeError:
+                return      # test doubles without recv()
+
     def stop_streaming(self):
         """Stop UDP streaming"""
         try:
@@ -1645,6 +1685,7 @@ class NMEAHandler:
             self.udp_socket.sendto(encoded_message, (self.UDP_HOST, port))
             setattr(self, counter_attr, getattr(self, counter_attr) + 1)
             self.streamed_messages += 1
+            self._maybe_drain_udp_socket()
         except Exception as e:
             self.app_logger.error(f"Error streaming message to {self.UDP_HOST}:{port}: {e}")
             try:

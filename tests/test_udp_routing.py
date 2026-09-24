@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -53,13 +54,22 @@ def _load_main_with_tempdirs():
 class _FakeSocket:
     """Records `sendto((data, addr))` and never touches the network."""
 
-    def __init__(self):
+    def __init__(self, to_receive=None):
         self.sent = []
         self.closed = False
         self.bound = None
+        # Datagrams the "autopilot" has queued back to our sender.
+        self.to_receive = list(to_receive or [])
+        self.recv_calls = 0
 
     def bind(self, addr):
         self.bound = addr
+
+    def recv(self, bufsize, flags=0):
+        self.recv_calls += 1
+        if not self.to_receive:
+            raise BlockingIOError('no data')
+        return self.to_receive.pop(0)
 
     def sendto(self, data, addr):
         self.sent.append((data, addr))
@@ -81,6 +91,9 @@ class UdpRoutingTests(unittest.TestCase):
         self.handler.streamed_messages = 0
         self.handler.streamed_wind_messages = 0
         self.handler.streamed_gps_messages = 0
+        # Suppress the ~1 Hz drain unless a test opts in, so send-path
+        # assertions aren't perturbed by recv() bookkeeping.
+        self.handler._last_udp_drain_ts = time.monotonic()
 
     def test_mwv_routes_to_wind_port_only(self):
         self.handler.stream_message('$WIMWV,45.0,R,10.0,N,A*3B', 'MWV')
@@ -183,6 +196,63 @@ class UdpRoutingTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.handler._create_udp_socket()
         self.assertTrue(fake.closed)
+
+    def test_drain_discards_autopilot_replies(self):
+        """ArduPilot's NMEA GPS driver probes its connected peer, which
+        is now our fixed sender port. Those datagrams must be consumed
+        so the receive buffer doesn't just fill and stay full."""
+        probes = [b'$PUBX,41,1,0023,0001,230400,0*1E\r\n',
+                  b'CONFIG COM1 230400 8 n 1\r\n']
+        sock = _FakeSocket(to_receive=list(probes))
+        self.handler.udp_socket = sock
+        self.handler._last_udp_drain_ts = 0.0   # force the drain to run
+        self.handler.stream_message('$GPGGA,...', 'GGA')
+        self.assertEqual(sock.to_receive, [], 'queued replies must be drained')
+        # The sentence still went out.
+        self.assertEqual(len(sock.sent), 1)
+        self.assertEqual(sock.sent[0][1], ('127.0.0.1', 27002))
+
+    def test_drain_is_throttled_not_per_message(self):
+        """At ~40 Hz a per-send drain would be pure overhead; the drain
+        runs about once a second."""
+        sock = _FakeSocket()
+        self.handler.udp_socket = sock
+        self.handler._last_udp_drain_ts = 0.0
+        self.handler.stream_message('$GPGGA,...', 'GGA')
+        after_first = sock.recv_calls
+        self.assertGreater(after_first, 0, 'first send should drain')
+        for _ in range(20):
+            self.handler.stream_message('$GPGGA,...', 'GGA')
+        self.assertEqual(
+            sock.recv_calls, after_first,
+            'subsequent sends within the interval must not re-drain',
+        )
+
+    def test_drain_stops_at_bound(self):
+        """A flood must not stall the serial reader thread."""
+        flood = [b'x'] * (self.handler.UDP_DRAIN_MAX_DATAGRAMS + 50)
+        sock = _FakeSocket(to_receive=flood)
+        self.handler.udp_socket = sock
+        self.handler._last_udp_drain_ts = 0.0
+        self.handler.stream_message('$GPGGA,...', 'GGA')
+        self.assertEqual(sock.recv_calls, self.handler.UDP_DRAIN_MAX_DATAGRAMS)
+        self.assertEqual(len(sock.to_receive), 50)
+
+    def test_drain_survives_socket_errors(self):
+        """A torn-down socket mid-drain must not escape into the send
+        path's error handler and trigger a needless socket rebuild."""
+        class _ExplodingSocket(_FakeSocket):
+            def recv(self, bufsize, flags=0):
+                raise OSError('socket closed')
+
+        sock = _ExplodingSocket()
+        self.handler.udp_socket = sock
+        self.handler._last_udp_drain_ts = 0.0
+        self.handler.stream_message('$GPGGA,...', 'GGA')
+        # Send succeeded and the socket was not swapped out.
+        self.assertEqual(len(sock.sent), 1)
+        self.assertIs(self.handler.udp_socket, sock)
+        self.assertFalse(sock.closed)
 
     def test_status_snapshot_has_no_legacy_mode_key(self):
         snap = self.handler._stream_status_snapshot()
