@@ -88,6 +88,8 @@ class UdpRoutingTests(unittest.TestCase):
         # Reset counters and captured payloads between tests.
         self.handler.udp_socket = _FakeSocket()
         self.handler.is_streaming = True
+        self.handler.state['stream_wind'] = True
+        self.handler.state['stream_gps'] = True
         self.handler.streamed_messages = 0
         self.handler.streamed_wind_messages = 0
         self.handler.streamed_gps_messages = 0
@@ -149,12 +151,41 @@ class UdpRoutingTests(unittest.TestCase):
         self.assertEqual(self.handler.streamed_messages, 0)
 
     def test_not_streaming_sends_nothing(self):
-        self.handler.is_streaming = False
-        try:
-            self.handler.stream_message('$WIMWV,...', 'MWV')
-            self.assertEqual(self.handler.udp_socket.sent, [])
-        finally:
-            self.handler.is_streaming = True
+        self.handler.state['stream_wind'] = False
+        self.handler.state['stream_gps'] = False
+        self.handler.stream_message('$WIMWV,...', 'MWV')
+        self.handler.stream_message('$GPGGA,...', 'GGA')
+        self.assertEqual(self.handler.udp_socket.sent, [])
+
+    def test_wind_only_skips_gps(self):
+        self.handler.state['stream_gps'] = False
+        self.handler.stream_message('$WIMWV,...', 'MWV')
+        self.handler.stream_message('$GPGGA,...', 'GGA')
+        self.handler.stream_message('$HCHDT,...', 'HDT')
+        addrs = [addr for _, addr in self.handler.udp_socket.sent]
+        self.assertEqual(addrs, [('127.0.0.1', 27001)])
+        self.assertEqual(self.handler.streamed_gps_messages, 0)
+
+    def test_gps_only_skips_wind(self):
+        self.handler.state['stream_wind'] = False
+        self.handler.stream_message('$WIMWV,...', 'MWV')
+        self.handler.stream_message('$GPRMC,...', 'RMC')
+        addrs = [addr for _, addr in self.handler.udp_socket.sent]
+        self.assertEqual(addrs, [('127.0.0.1', 27002)])
+        self.assertEqual(self.handler.streamed_wind_messages, 0)
+
+    def test_set_stream_routes_persists_and_derives_is_streaming(self):
+        with mock.patch.object(self.handler, '_create_udp_socket', return_value=_FakeSocket()):
+            self.handler.set_stream_routes(wind=False, gps=False)
+            self.assertFalse(self.handler.is_streaming)
+            self.assertIsNone(self.handler.udp_socket)
+            self.handler.set_stream_routes(gps=True)
+            self.assertTrue(self.handler.is_streaming)
+            self.assertFalse(self.handler.state['stream_wind'])
+            self.assertTrue(self.handler.state['stream_gps'])
+            by_name = {r['name']: r for r in self.handler.get_stream_routes()}
+            self.assertFalse(by_name['wind']['enabled'])
+            self.assertTrue(by_name['gps']['enabled'])
 
     def test_get_stream_routes_reports_both_ports(self):
         self.handler.streamed_wind_messages = 3

@@ -194,5 +194,53 @@ class MigrationTests(unittest.TestCase):
             self.assertTrue(setup['ignore_drift'])
 
 
+
+class StreamRouteMigrationTests(unittest.TestCase):
+    """1.1.10: UDP routes became per-route opt-in instead of auto-on at connect."""
+
+    def _load_with(self, persisted):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log_dir = Path(tmp.name) / 'logs'
+        log_dir.mkdir()
+        main = _load_main(log_dir)
+        state_path = Path(tmp.name) / 'state.json'
+        state_path.write_text(json.dumps(persisted))
+        handler = main.nmea_handler
+        handler.state_path = state_path
+        handler.state = {
+            'port': None, 'baud_rate': 4800, 'stay_at_4800': False,
+            'is_streaming': False, 'stream_wind': False, 'stream_gps': False,
+            'sentence_config': {}, 'autopilot_setup': {},
+        }
+        handler.load_state()
+        return handler
+
+    def test_fresh_legacy_install_defaults_off(self):
+        h = self._load_with({'port': None, 'is_streaming': True})
+        self.assertFalse(h.state['stream_wind'])
+        self.assertFalse(h.state['stream_gps'])
+        self.assertFalse(h.is_streaming)
+
+    def test_legacy_install_with_applied_setup_keeps_both_on(self):
+        h = self._load_with({
+            'port': '/dev/ttyUSB1', 'is_streaming': True,
+            'autopilot_setup': {'applied': True, 'wind_serial': 2, 'gps_serial': 7,
+                                'expected': {'GPS1_TYPE': 1.0, 'GPS2_TYPE': 5.0}},
+        })
+        self.assertTrue(h.state['stream_wind'])
+        self.assertTrue(h.state['stream_gps'])
+        self.assertTrue(h.is_streaming)
+
+    def test_saved_choice_is_respected(self):
+        h = self._load_with({
+            'stream_wind': True, 'stream_gps': False,
+            'autopilot_setup': {'applied': True,
+                                'expected': {'GPS1_TYPE': 1.0, 'GPS2_TYPE': 5.0}},
+        })
+        self.assertTrue(h.state['stream_wind'])
+        self.assertFalse(h.state['stream_gps'])
+        self.assertTrue(h.is_streaming)
+
 if __name__ == '__main__':
     unittest.main()

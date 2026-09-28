@@ -271,7 +271,11 @@ class NMEAHandler:
             'port_id': None,
             'baud_rate': 4800,
             'stay_at_4800': False,  # persisted; used by startup auto-connect
-            'is_streaming': False,
+            'is_streaming': False,  # derived: stream_wind or stream_gps
+            # Per-route UDP output to ArduPilot. Off until the user ticks the
+            # checkbox; never switched on implicitly by connecting.
+            'stream_wind': False,   # $WIMWV → UDP 27001
+            'stream_gps': False,    # $GPGGA/RMC/VTG, $HCHDT → UDP 27002
             'sentence_config': {},  # { sentence_id: { "enabled": bool, "interval": int (tenths) } }
             # Persisted ArduRover autopilot setup (see mavlink_params.py).
             # Populated after the user picks SERIAL X/Y and applies once.
@@ -523,7 +527,19 @@ class NMEAHandler:
                 # drift against the correct expectation, and the operator
                 # can hit Restore to apply the new contract, or Ignore.
                 self._migrate_autopilot_setup_gps_contract()
-                self.is_streaming = self.state.get('is_streaming', False)
+                # Migration (1.1.10): both routes used to start automatically
+                # on every connect. Installs that already applied the
+                # ArduRover setup depend on that, so keep both on for them;
+                # everyone else starts with both off.
+                if 'stream_wind' not in loaded or 'stream_gps' not in loaded:
+                    keep = bool((self.state.get('autopilot_setup') or {}).get('applied'))
+                    for key in ('stream_wind', 'stream_gps'):
+                        if key not in loaded:
+                            self.state[key] = keep
+                    self.app_logger.info(
+                        "Migrating UDP streaming to per-route opt-in: "
+                        f"wind={self.state['stream_wind']}, gps={self.state['stream_gps']}")
+                self.is_streaming = bool(self.state['stream_wind'] or self.state['stream_gps'])
                 self.app_logger.debug(f"Loaded state: port={self.state['port']}, baud={self.state['baud_rate']}, streaming={self.is_streaming}")
         except Exception as e:
             self.app_logger.error(f"Error loading state: {e}")
@@ -837,6 +853,8 @@ class NMEAHandler:
             now = time.time()
         return {
             'is_streaming': self.is_streaming,
+            'stream_wind': bool(self.state.get('stream_wind')),
+            'stream_gps': bool(self.state.get('stream_gps')),
             'routes': self.get_stream_routes(),
             'streamed_messages': self.streamed_messages,
             'streamed_wind_messages': self.streamed_wind_messages,
@@ -919,10 +937,9 @@ class NMEAHandler:
                         # Push derived aggregates/status (throttled)
                         self._emit_sensor_if_due()
                         self._emit_status_if_due()
-                        # Forward to autopilot via UDP. Both routes are
-                        # always active: `stream_message` picks the right
-                        # port (27001 for wind, 27002 for GPS) or skips
-                        # sentences that neither driver cares about.
+                        # Forward to autopilot via UDP. `stream_message`
+                        # picks the route (27001 wind, 27002 GPS) and skips
+                        # routes the user has not enabled.
                         if self.is_streaming:
                             self.stream_message(data, msg_type)
                 except Exception as e:
@@ -1281,37 +1298,49 @@ class NMEAHandler:
         """Return the current aggregated sensor data for dashboard."""
         return self.sensor_data
 
-    def start_streaming(self):
-        """Start dual-route UDP streaming (idempotent).
+    def set_stream_routes(self, wind=None, gps=None):
+        """Enable/disable the UDP routes to ArduPilot and persist the choice.
 
         Wind sentences go to `UDP_HOST:UDP_WIND_PORT` (27001) and GPS/
         heading sentences go to `UDP_HOST:UDP_GPS_PORT` (27002). Both
-        routes share a single socket; each has its own counter.
+        routes share a single socket; each has its own counter. `None`
+        leaves a route unchanged.
         """
         try:
-            if not self.udp_socket:
-                self.udp_socket = self._create_udp_socket()
-            if not self.is_streaming:
-                # Reset counters only when actually starting so a re-toggle
-                # after a stop starts fresh, but redundant `start` calls do
-                # not zero the accumulators mid-run.
+            was_streaming = self.is_streaming
+            if wind is not None:
+                if bool(wind) and not self.state.get('stream_wind'):
+                    self.streamed_wind_messages = 0
+                self.state['stream_wind'] = bool(wind)
+            if gps is not None:
+                if bool(gps) and not self.state.get('stream_gps'):
+                    self.streamed_gps_messages = 0
+                self.state['stream_gps'] = bool(gps)
+            self.is_streaming = bool(self.state['stream_wind'] or self.state['stream_gps'])
+            if self.is_streaming and not was_streaming:
                 self.streamed_messages = 0
-                self.streamed_wind_messages = 0
-                self.streamed_gps_messages = 0
-            self.is_streaming = True
-            self.state['is_streaming'] = True
+            if self.is_streaming and not self.udp_socket:
+                self.udp_socket = self._create_udp_socket()
+            elif not self.is_streaming and self.udp_socket:
+                self.udp_socket.close()
+                self.udp_socket = None
             self.save_state()
             self.app_logger.info(
-                "UDP streaming started — source %s:%d; "
-                "wind %s → %s:%d, gps %s → %s:%d",
+                "UDP streaming — source %s:%d; wind %s → %s:%d %s; gps %s → %s:%d %s",
                 self.UDP_HOST, self.UDP_SOURCE_PORT,
                 sorted(self.UDP_WIND_SENTENCES), self.UDP_HOST, self.UDP_WIND_PORT,
+                'ON' if self.state['stream_wind'] else 'off',
                 sorted(self.UDP_GPS_SENTENCES), self.UDP_HOST, self.UDP_GPS_PORT,
+                'ON' if self.state['stream_gps'] else 'off',
             )
-            return True, "Streaming started"
+            return True, "Streaming routes updated"
         except Exception as e:
-            self.app_logger.error(f"Error starting UDP stream: {e}")
+            self.app_logger.error(f"Error updating UDP stream routes: {e}")
             return False, str(e)
+
+    def start_streaming(self):
+        """Enable both UDP routes."""
+        return self.set_stream_routes(wind=True, gps=True)
 
     def _create_udp_socket(self):
         """Create a sender bound to ArduPilot's stable peer endpoint."""
@@ -1352,19 +1381,8 @@ class NMEAHandler:
                 return      # test doubles without recv()
 
     def stop_streaming(self):
-        """Stop UDP streaming"""
-        try:
-            if self.udp_socket:
-                self.udp_socket.close()
-                self.udp_socket = None
-            self.is_streaming = False
-            self.state['is_streaming'] = False
-            self.save_state()
-            self.app_logger.info("UDP streaming stopped")
-            return True, "Streaming stopped"
-        except Exception as e:
-            self.app_logger.error(f"Error stopping UDP stream: {e}")
-            return False, str(e)
+        """Disable both UDP routes."""
+        return self.set_stream_routes(wind=False, gps=False)
 
     def _route_for_sentence(self, msg_type):
         """Return (port, counter_attr) if `msg_type` maps to a UDP route, else None.
@@ -1378,9 +1396,9 @@ class NMEAHandler:
             return None
         tail = msg_type[-3:]
         if tail in self.UDP_WIND_SENTENCES:
-            return (self.UDP_WIND_PORT, 'streamed_wind_messages')
+            return (self.UDP_WIND_PORT, 'streamed_wind_messages', 'stream_wind')
         if tail in self.UDP_GPS_SENTENCES:
-            return (self.UDP_GPS_PORT, 'streamed_gps_messages')
+            return (self.UDP_GPS_PORT, 'streamed_gps_messages', 'stream_gps')
         return None
 
     def get_stream_routes(self):
@@ -1394,6 +1412,7 @@ class NMEAHandler:
                 'endpoint': f'{self.UDP_HOST}:{self.UDP_WIND_PORT}',
                 'source_endpoint': f'{self.UDP_HOST}:{self.UDP_SOURCE_PORT}',
                 'streamed_messages': self.streamed_wind_messages,
+                'enabled': bool(self.state.get('stream_wind')),
             },
             {
                 'name': 'gps',
@@ -1403,6 +1422,7 @@ class NMEAHandler:
                 'endpoint': f'{self.UDP_HOST}:{self.UDP_GPS_PORT}',
                 'source_endpoint': f'{self.UDP_HOST}:{self.UDP_SOURCE_PORT}',
                 'streamed_messages': self.streamed_gps_messages,
+                'enabled': bool(self.state.get('stream_gps')),
             },
         ]
 
@@ -1714,7 +1734,9 @@ class NMEAHandler:
         route = self._route_for_sentence(msg_type)
         if route is None:
             return
-        port, counter_attr = route
+        port, counter_attr, enabled_key = route
+        if not self.state.get(enabled_key):
+            return
         try:
             if not self.udp_socket:
                 self.udp_socket = self._create_udp_socket()
@@ -2631,10 +2653,7 @@ class NMEAHandler:
                                           f"Connected to {port} at {final_baud} baud{detected_msg}")
                     self.app_logger.info(self.connection_message)
                     self._sse_broadcast('connection', self.get_connection_info())
-                    
-                    # Auto-start streaming WIMWV to autopilot on connect
-                    self.start_streaming()
-                    
+
                     return True, self.connection_message
             
             # All attempts failed
@@ -2651,11 +2670,8 @@ class NMEAHandler:
     def disconnect_serial(self):
         """Disconnect from serial port"""
         try:
-            # Stop streaming first
-            if self.is_streaming:
-                self.stop_streaming()
-            
-            # Stop the reader thread
+            # Stop the reader thread. The per-route streaming choice is kept
+            # so it applies again on the next connect.
             self.stop_reader_thread()
             
             # Close the serial connection
@@ -3197,6 +3213,19 @@ def stop_streaming():
     """Stop UDP streaming"""
     success, message = nmea_handler.stop_streaming()
     return jsonify({"success": success, "message": message})
+
+@app.route('/api/stream/routes', methods=['POST'])
+def set_stream_routes():
+    """Enable/disable individual UDP routes: {"wind": bool, "gps": bool} (either optional)."""
+    data = request.get_json() or {}
+    wind = data.get('wind')
+    gps = data.get('gps')
+    if (wind is not None and not isinstance(wind, bool)) or \
+            (gps is not None and not isinstance(gps, bool)):
+        return jsonify({"success": False, "message": "wind/gps must be true or false"})
+    success, message = nmea_handler.set_stream_routes(wind=wind, gps=gps)
+    return jsonify({"success": success, "message": message,
+                    **nmea_handler._stream_status_snapshot()})
 
 @app.route('/api/stream/status', methods=['GET'])
 def get_streaming_status():

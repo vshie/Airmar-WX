@@ -11,7 +11,7 @@ A BlueOS extension for the Airmar 300WX WeatherStation. Connects via NMEA 0183 s
 - Per-sentence enable/disable and transmission interval control
 - Bandwidth usage indicator (percentage of serial bus capacity)
 - Raw message view with one card per message type and live Hz rate
-- Dual UDP streams to ArduPilot — wind on `27001` and GPS + heading on `27002`, always active while streaming is on
+- Dual UDP streams to ArduPilot — wind on `27001` and GPS + heading on `27002`, each enabled by its own checkbox (both off by default)
 - One-click ArduRover parameter setup (SERIAL X/Y, wind vane + GPS NMEA + optional GPS-yaw source) with drift detection and restore/ignore
 - Cockpit data-lake WebSocket streaming of wind, GPS, and heading data
 - Persistent NMEA message and application logs with download/delete
@@ -79,7 +79,9 @@ When manually installing, paste this into the **Custom settings** field:
 
 ## ArduPilot UDP Streaming (dual routes)
 
-The extension forwards NMEA sentences to the autopilot via **two** UDP ports at the same time so both the wind vane driver and the GPS/heading driver can be fed simultaneously (each ArduPilot serial has a single `SERIALx_PROTOCOL`, so one port cannot serve both drivers).
+The extension can forward NMEA sentences to the autopilot via **two** UDP ports at the same time so both the wind vane driver and the GPS/heading driver can be fed simultaneously (each ArduPilot serial has a single `SERIALx_PROTOCOL`, so one port cannot serve both drivers).
+
+Each route has its own checkbox under **Send to ArduPilot over UDP** in the connection panel, and **both are off by default** — nothing is sent to the autopilot until you tick one. The choice is saved and applies on every connect and restart. Connecting or disconnecting the sensor does not change it. When upgrading from 1.1.9 or earlier, an install that has already applied the ArduRover parameter setup keeps both routes on; otherwise both start off.
 
 | Route | UDP port | Sentences | ArduPilot driver |
 |---|---|---|---|
@@ -168,7 +170,7 @@ Post-flight, comparing the two answers a single diagnostic question: did `$WIMWV
 
 - Values are only published when the underlying NMEA parse is fresh (< 5 s old). Stale or missing values are skipped, **not** sent as zero.
 - Each NVF uses its own MAVLink `component_id` (`WX_AppDir`=70, `WX_AppSpd`=71, `WX_TruDir`=72, `WX_TruSpd`=73, all under `system_id=255`). mavlink-server's GET cache stores by `(system_id, component_id, message_type)`, so distinct component IDs are required for all four values to remain visible in the BlueOS MAVLink inspector. The autopilot logs every NVF it receives regardless.
-- Publishing is always-on while the extension is running; it does **not** depend on the UDP "Start streaming" toggle.
+- Publishing is always-on while the extension is running; it does **not** depend on the UDP wind / GPS checkboxes.
 - Diagnostics: `GET http://<vehicle>:6436/api/mavlink/nvf_status` returns publish count, planned component IDs, and the timestamp of the last successful POST.
 
 ## Cockpit WebSocket Streaming

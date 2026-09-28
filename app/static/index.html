@@ -624,7 +624,7 @@
                         <div class="text-caption mt-1">
                           Received {{ streamingStatus.messages_received }} NMEA sentences since connect.
                         </div>
-                        <div v-for="route in (streamingStatus.routes || [])" :key="route.name" class="text-caption">
+                        <div v-for="route in (streamingStatus.routes || []).filter(r => r.enabled)" :key="route.name" class="text-caption">
                           <span class="text-capitalize">{{ route.name }}</span>
                           <code class="ml-1">{{ route.endpoint }}</code>
                           &mdash; {{ (route.sentences || []).join(', ') }}
@@ -678,15 +678,54 @@
                       <v-icon left>mdi-connection</v-icon>
                       Disconnect
                     </v-btn>
-                    <v-btn
-                      :color="isStreaming ? 'warning' : 'success'"
-                      @click="toggleStreaming"
-                      class="mr-2"
-                    >
-                      <v-icon left>{{ isStreaming ? 'mdi-stop' : 'mdi-broadcast' }}</v-icon>
-                      {{ isStreaming ? 'Stop Stream' : 'Start Stream' }}
-                    </v-btn>
                   </template>
+                </v-col>
+              </v-row>
+              <!-- Per-route UDP output to ArduPilot (off until ticked; saved across restarts) -->
+              <v-row>
+                <v-col cols="12" class="pt-0">
+                  <div class="text-subtitle-2">Send to ArduPilot over UDP</div>
+                  <v-checkbox
+                    v-model="streamWind"
+                    @change="setStreamRoute('wind', $event)"
+                    label="Wind ($WIMWV → 127.0.0.1:27001)"
+                    hide-details
+                    dense
+                    class="mt-1"
+                  ></v-checkbox>
+                  <v-checkbox
+                    v-model="streamGps"
+                    @change="setStreamRoute('gps', $event)"
+                    label="GPS + heading ($GPGGA, $GPRMC, $GPVTG, $HCHDT → 127.0.0.1:27002)"
+                    hide-details
+                    dense
+                    class="mt-1"
+                  ></v-checkbox>
+                  <!-- ArduPilot ignores these streams until a SERIAL port is mapped
+                       to the udpin string and the ArduRover parameters are applied. -->
+                  <v-alert
+                    v-if="streamSetupHintVisible"
+                    type="warning"
+                    dense
+                    text
+                    class="mt-3 mb-0"
+                  >
+                    <div>
+                      ArduPilot will ignore
+                      {{ streamWind && streamGps ? 'these streams' : 'this stream' }}
+                      until it is configured to receive
+                      {{ streamWind && streamGps ? 'them' : 'it' }}:
+                      map a SERIAL port to
+                      <span v-if="streamWind"><code>{{ udpinWindString }}</code></span><span v-if="streamWind && streamGps"> and </span><span v-if="streamGps"><code>{{ udpinGpsString }}</code></span>
+                      in BlueOS, then apply the ArduRover parameters.
+                    </div>
+                    <div class="mt-2">
+                      <v-btn small color="warning" depressed @click="openAutopilotSetup">
+                        <v-icon small left>mdi-cog</v-icon>
+                        Open Setup, step 2
+                      </v-btn>
+                    </div>
+                  </v-alert>
                 </v-col>
               </v-row>
             </v-card-text>
@@ -751,7 +790,7 @@
                          controls live. Everything used to live in the
                          Sentences tab; it now belongs with the setup steps.
                     -->
-                    <v-card outlined class="mb-4">
+                    <v-card outlined class="mb-4" ref="autopilotSetupCard">
                       <v-card-title class="text-subtitle-1">
                         <v-chip small color="primary" class="mr-2" text-color="white">2</v-chip>
                         Configure ArduRover to receive the two NMEA streams
@@ -1920,6 +1959,8 @@
         serialPortInfo: { serial_port: 'Not connected', baud_rate: 0 },
         pollingInterval: null,
         isStreaming: false,
+        streamWind: false,
+        streamGps: false,
         // Dual-route UDP streaming status (wind → 27001, gps → 27002).
         streamingStatus: {
           routes: [],
@@ -2109,6 +2150,12 @@
         },
         autopilotSetupScreenshotSrc() {
           return '/static/images/blueos-serial-config.png';
+        },
+        // Shown while a UDP route is ticked but the ArduRover setup has not
+        // been applied, or has drifted since it was applied.
+        streamSetupHintVisible() {
+          if (!this.streamWind && !this.streamGps) return false;
+          return !this.autopilotSetup.applied || this.autopilotDriftBannerVisible;
         },
         autopilotDriftBannerVisible() {
           return this.autopilotSetup.applied &&
@@ -2563,6 +2610,8 @@
             _last_count_at: now
           };
           if (typeof ss.is_streaming === 'boolean') this.isStreaming = ss.is_streaming;
+          if (typeof ss.stream_wind === 'boolean') this.streamWind = ss.stream_wind;
+          if (typeof ss.stream_gps === 'boolean') this.streamGps = ss.stream_gps;
           if (ss.autopilot_setup) this.mergeAutopilotSetup(ss.autopilot_setup);
           // Keep sentence switches in sync using last-seen
           if (this.connectionInfo.connected && ss.observed_sentence_last_seen && this.sentences.length > 0) {
@@ -3317,52 +3366,44 @@
             done();
           }
         },
-        async toggleStreaming() {
+        openAutopilotSetup() {
+          this.activeTab = 0;  // Setup tab
+          // Wait for the tab transition to render before scrolling.
+          setTimeout(() => {
+            const card = this.$refs.autopilotSetupCard;
+            const el = card && (card.$el || card);
+            if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }, 300);
+        },
+        async setStreamRoute(route, enabled) {
           try {
-            if (this.isStreaming) {
-              const response = await axios.post('/api/stream/stop');
-              if (response.data.success) {
-                this.isStreaming = false;
-                this.streamingStatus.streamed_messages = 0;
-                this.streamingStatus.messages_received = 0;
-              }
+            const response = await axios.post('/api/stream/routes', { [route]: !!enabled });
+            if (response.data.success) {
+              this.applyStreamStatus(response.data);
             } else {
-              const response = await axios.post('/api/stream/start');
-              if (response.data.success) {
-                this.isStreaming = true;
-                this.streamingStatus.streamed_messages = 0;
-                this.streamingStatus.messages_received = 0;
-              }
+              console.error('Error updating stream route:', response.data.message);
+              await this.checkStreamingStatus();
             }
-            // Update streaming status after toggle
-            await this.checkStreamingStatus();
           } catch (error) {
-            console.error('Error toggling streaming:', error);
+            console.error('Error updating stream route:', error);
+            await this.checkStreamingStatus();
           }
         },
         async checkStreamingStatus() {
           try {
             const response = await axios.get('/api/stream/status');
-            this.isStreaming = !!response.data.is_streaming;
             this.applyStreamStatus(response.data);
-            if (response.data.is_streaming && !this.isStreaming) {
-              await this.toggleStreaming();
-            }
           } catch (error) {
             console.error('Error checking streaming status:', error);
           }
         },
         async disconnectPort() {
           try {
-            if (this.isStreaming) {
-              await this.toggleStreaming();
-            }
             const response = await axios.post('/api/serial/disconnect');
             if (response.data.success) {
               this.stopPolling();
               this.messages = [];
               this.latestByType = {};
-              this.isStreaming = false;
               this.serialPortInfo = { serial_port: 'Not connected', baud_rate: 0 };
               this.connectionInfo = {
                 connected: false,
