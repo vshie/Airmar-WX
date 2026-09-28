@@ -2272,15 +2272,6 @@ class NMEAHandler:
                 return True, "No changes to apply"
             errors = []
             applied = 0
-            # #region agent log
-            try:
-                _dbg_path = Path(__file__).resolve().parent.parent / '.cursor' / 'debug.log'
-                _dbg_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(_dbg_path, 'a') as _f:
-                    _f.write(json.dumps({'id': 'batch_lock_enter', 'timestamp': time.time(), 'location': 'main.py:configure_sentences_batch', 'message': 'batch lock enter', 'data': {'n_changes': len(changes)}, 'hypothesisId': 'H3'}) + '\n')
-            except Exception:
-                pass
-            # #endregion
             with self._serial_lock:
                 for ch in changes:
                     sentence_id = ch.get('sentence_id')
@@ -2303,14 +2294,6 @@ class NMEAHandler:
                         time.sleep(0.15)
                     except Exception as e:
                         errors.append(f"{sentence_id}: {e}")
-            # #region agent log
-            try:
-                _dbg_path = Path(__file__).resolve().parent.parent / '.cursor' / 'debug.log'
-                with open(_dbg_path, 'a') as _f:
-                    _f.write(json.dumps({'id': 'batch_lock_exit', 'timestamp': time.time(), 'location': 'main.py:configure_sentences_batch', 'message': 'batch lock exit', 'data': {'applied': applied, 'n_changes': len(changes)}, 'hypothesisId': 'H3'}) + '\n')
-            except Exception:
-                pass
-            # #endregion
             if applied > 0:
                 self.save_state()
             if errors:
@@ -2440,15 +2423,6 @@ class NMEAHandler:
             if not self.serial_connection or not self.serial_connection.is_open:
                 return False, "Not connected"
             
-            # #region agent log
-            try:
-                _dbg_path = Path(__file__).resolve().parent.parent / '.cursor' / 'debug.log'
-                _dbg_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(_dbg_path, 'a') as _f:
-                    _f.write(json.dumps({'id': 'query_lock_enter', 'timestamp': time.time(), 'location': 'main.py:query_sentence_config', 'message': 'query lock enter (will hold up to 5s)', 'data': {}, 'hypothesisId': 'H4'}) + '\n')
-            except Exception:
-                pass
-            # #endregion
             with self._serial_lock:
                 # Clear any pending data
                 self.serial_connection.reset_input_buffer()
@@ -2500,14 +2474,6 @@ class NMEAHandler:
                     if len(config) >= len(self.SUPPORTED_SENTENCES):
                         break
                     time.sleep(0.05)
-            # #region agent log
-            try:
-                _dbg_path = Path(__file__).resolve().parent.parent / '.cursor' / 'debug.log'
-                with open(_dbg_path, 'a') as _f:
-                    _f.write(json.dumps({'id': 'query_lock_exit', 'timestamp': time.time(), 'location': 'main.py:query_sentence_config', 'message': 'query lock exit', 'data': {'config_count': len(config)}, 'hypothesisId': 'H4'}) + '\n')
-            except Exception:
-                pass
-            # #endregion
             if config:
                 self.device_sentence_config.update(config)
                 return True, config

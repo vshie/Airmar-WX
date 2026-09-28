@@ -1952,7 +1952,6 @@
       el: '#app',
       vuetify: new Vuetify(),
       data: {
-        messages: [],
         latestByType: {},
         availablePorts: [],
         deviceIds: [],
@@ -2175,15 +2174,34 @@
                  Array.isArray(this.autopilotSetup.drift) &&
                  this.autopilotSetup.drift.length > 0;
         },
-        parsedMessages() {
-          return this.messages.map(msg => {
-            const parsed = this.parseNMEA(msg.raw, msg.type);
-            return {
-              ...msg,
-              description: this.nmeaDescriptions[msg.type] || 'Unknown Message Type',
-              values: parsed
+        sparklineCache() {
+          const width = 100;
+          const height = 30;
+          const padding = 2;
+          const out = {};
+          for (const [key, data] of Object.entries(this.sensorHistory || {})) {
+            if (!Array.isArray(data) || data.length < 2) continue;
+            // Sort by time (oldest first, t is seconds ago so higher = older)
+            const sorted = data.slice().sort((a, b) => b.t - a.t);
+            let minVal = Infinity;
+            let maxVal = -Infinity;
+            for (const d of sorted) {
+              if (d.v < minVal) minVal = d.v;
+              if (d.v > maxVal) maxVal = d.v;
+            }
+            const range = maxVal - minVal || 1;
+            const points = sorted.map((d, i) => {
+              const x = padding + (i / (sorted.length - 1)) * (width - 2 * padding);
+              const y = height - padding - ((d.v - minVal) / range) * (height - 2 * padding);
+              return `${x},${y}`;
+            });
+            const lastX = padding + (width - 2 * padding);
+            out[key] = {
+              path: `M${points.join(' L')}`,
+              area: `M${padding},${height} L${points.join(' L')} L${lastX},${height} Z`
             };
-          });
+          }
+          return out;
         },
         latestMessageCards() {
           return Object.values(this.latestByType)
@@ -2557,31 +2575,14 @@
               console.error('Error parsing init SSE:', e);
             }
           });
+          // ~50 messages/s arrive (10 Hz GPS sentences). Applying each one to
+          // reactive state re-rendered the whole single-component app per
+          // message, so buffer them and apply in one batch a few times a second.
           es.addEventListener('nmea_message', (ev) => {
-            try {
-              const msg = JSON.parse(ev.data);
-              this.messages.unshift(msg);
-              if (this.messages.length > 200) this.messages.pop();
-
-              const t = msg.type;
-              if (!t) return;
-              const now = Date.now() / 1000;
-              const prev = this.latestByType[t];
-              const timestamps = prev ? prev._timestamps.concat(now) : [now];
-              const cutoff = now - 5;
-              const recent = timestamps.filter(ts => ts > cutoff);
-              const rawHz = recent.length >= 2
-                ? (recent.length - 1) / (recent[recent.length - 1] - recent[0])
-                : 0;
-              const hz = isFinite(rawHz) ? rawHz : 0;
-              this.$set(this.latestByType, t, {
-                raw: msg.raw,
-                type: t,
-                timestamp: msg.timestamp,
-                hz: hz,
-                _timestamps: recent
-              });
-            } catch (e) {}
+            try { this._nmeaBuffer.push(JSON.parse(ev.data)); } catch (e) {}
+            if (!this._nmeaFlushTimer) {
+              this._nmeaFlushTimer = setTimeout(() => this.flushNmeaBuffer(), 250);
+            }
           });
           es.addEventListener('sensor_data', (ev) => {
             try { this.sensorData = JSON.parse(ev.data); } catch (e) {}
@@ -2595,7 +2596,49 @@
             } catch (e) {}
           });
         },
+        flushNmeaBuffer() {
+          this._nmeaFlushTimer = null;
+          const batch = this._nmeaBuffer;
+          if (!batch.length) return;
+          this._nmeaBuffer = [];
+          // Not rendered anywhere; kept non-reactive (see created()).
+          for (const msg of batch) this.messages.unshift(msg);
+          if (this.messages.length > 200) this.messages.length = 200;
+
+          const now = Date.now() / 1000;
+          const cutoff = now - 5;
+          const latestOfType = {};
+          const counts = {};
+          for (const msg of batch) {
+            if (!msg.type) continue;
+            latestOfType[msg.type] = msg;
+            counts[msg.type] = (counts[msg.type] || 0) + 1;
+          }
+          // One replacement of latestByType per flush instead of one $set per message.
+          const next = Object.assign({}, this.latestByType);
+          for (const [t, msg] of Object.entries(latestOfType)) {
+            const prev = next[t];
+            const timestamps = (prev ? prev._timestamps : []).filter(ts => ts > cutoff);
+            for (let i = 0; i < counts[t]; i++) timestamps.push(now);
+            // Rate over the observed window; batch arrivals share a timestamp,
+            // so measure from the first retained sample to now.
+            const span = timestamps.length ? now - timestamps[0] : 0;
+            const hz = (timestamps.length >= 2 && span > 0) ? (timestamps.length - 1) / span : 0;
+            next[t] = {
+              raw: msg.raw,
+              type: t,
+              timestamp: msg.timestamp,
+              hz: isFinite(hz) ? hz : 0,
+              _timestamps: timestamps
+            };
+          }
+          this.latestByType = next;
+        },
         stopSse() {
+          if (this._nmeaFlushTimer) {
+            clearTimeout(this._nmeaFlushTimer);
+            this._nmeaFlushTimer = null;
+          }
           if (this._eventSource) {
             try { this._eventSource.close(); } catch (e) {}
             this._eventSource = null;
@@ -2695,7 +2738,9 @@
         async fetchSensorHistory() {
           try {
             const response = await axios.get('/api/sensor/history');
-            this.sensorHistory = response.data;
+            // Frozen: read-only chart data; making ~12k points reactive every
+            // fetch was a large share of the page's CPU and GC load.
+            this.sensorHistory = Object.freeze(response.data);
           } catch (error) {
             console.error('Error fetching sensor history:', error);
           }
@@ -2714,57 +2759,15 @@
         toggleSparkline(key) {
           this.sparklineVisible[key] = !this.sparklineVisible[key];
         },
+        // Template calls these on every render; the paths are built once per
+        // history fetch in the `sparklineCache` computed instead.
         getSparklinePath(key) {
-          const data = this.sensorHistory[key];
-          if (!Array.isArray(data) || data.length < 2) return '';
-          
-          // Sort by time (oldest first, t is seconds ago so higher = older)
-          const sorted = [...data].sort((a, b) => b.t - a.t);
-          
-          // Get min/max for scaling
-          const values = sorted.map(d => d.v);
-          const minVal = Math.min(...values);
-          const maxVal = Math.max(...values);
-          const range = maxVal - minVal || 1;
-          
-          // SVG dimensions
-          const width = 100;
-          const height = 30;
-          const padding = 2;
-          
-          // Build path
-          const points = sorted.map((d, i) => {
-            const x = padding + (i / (sorted.length - 1)) * (width - 2 * padding);
-            const y = height - padding - ((d.v - minVal) / range) * (height - 2 * padding);
-            return `${x},${y}`;
-          });
-          
-          return `M${points.join(' L')}`;
+          const c = this.sparklineCache[key];
+          return c ? c.path : '';
         },
         getSparklineArea(key) {
-          const data = this.sensorHistory[key];
-          if (!Array.isArray(data) || data.length < 2) return '';
-          
-          const sorted = [...data].sort((a, b) => b.t - a.t);
-          const values = sorted.map(d => d.v);
-          const minVal = Math.min(...values);
-          const maxVal = Math.max(...values);
-          const range = maxVal - minVal || 1;
-          
-          const width = 100;
-          const height = 30;
-          const padding = 2;
-          
-          const points = sorted.map((d, i) => {
-            const x = padding + (i / (sorted.length - 1)) * (width - 2 * padding);
-            const y = height - padding - ((d.v - minVal) / range) * (height - 2 * padding);
-            return `${x},${y}`;
-          });
-          
-          // Close the path for area fill
-          const firstX = padding;
-          const lastX = padding + (width - 2 * padding);
-          return `M${firstX},${height} L${points.join(' L')} L${lastX},${height} Z`;
+          const c = this.sparklineCache[key];
+          return c ? c.area : '';
         },
         hasSparklineData(key) {
           const data = this.sensorHistory[key];
@@ -3228,6 +3231,7 @@
           }
         },
         startConnectionStatusPolling() {
+          if (this.connectionPollInterval) return;
           // Poll connection status every 500ms during connection
           this.connectionPollInterval = setInterval(async () => {
             await this.fetchConnectionStatus();
@@ -3564,7 +3568,10 @@
           }
         },
         startPolling() {
+          if (this.pollingInterval) return;  // several callers; never stack timers
+          let tick = 0;
           this.pollingInterval = setInterval(() => {
+            tick++;
             this.fetchConnectionStatus();
             // If SSE is down, fall back to polling
             if (!this.sse.connected) {
@@ -3572,8 +3579,10 @@
               this.checkStreamingStatus();
               this.fetchSensorData();
             }
-            // History is only needed for Dashboard sparklines / wind roses
-            if (this.activeTab === 1) {
+            // History is only needed for Dashboard sparklines / wind roses.
+            // It is ~230 KB; samples are taken at 1 Hz server-side, so every
+            // 3 s is plenty and keeps the Pi from re-serialising it each second.
+            if (this.activeTab === 1 && tick % 3 === 0) {
               this.fetchSensorHistory();
             }
           }, 1000);
@@ -3691,9 +3700,6 @@
           });
         },
         async flushSentenceChanges() {
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/7050f155-ae55-42cf-9654-50c506ff56ff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:flushSentenceChanges',message:'flush start',data:{pendingCount:Object.keys(this.pendingSentenceChanges||{}).length,inProgress:this.sentenceFlushInProgress},timestamp:Date.now(),hypothesisId:'H5'})}).catch(()=>{});
-          // #endregion
           if (this.sentenceFlushInProgress) return;
           const entries = Object.entries(this.pendingSentenceChanges || {});
           if (entries.length === 0) return;
@@ -3717,9 +3723,6 @@
             this.sentenceConfigSuccess = false;
             this.pendingSentenceChanges = {};
           } finally {
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/7050f155-ae55-42cf-9654-50c506ff56ff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:flushSentenceChanges',message:'flush end',data:{success:this.sentenceConfigSuccess,changesCount:numChanges},timestamp:Date.now(),hypothesisId:'H5'})}).catch(()=>{});
-            // #endregion
             this.sentenceFlushInProgress = false;
           }
         },
@@ -3736,9 +3739,6 @@
           await this.applySentenceConfig(sentenceId, this.sentenceConfig[sentenceId], sec);
         },
         async toggleSentence(sentenceId, enabled) {
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/7050f155-ae55-42cf-9654-50c506ff56ff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:toggleSentence',message:'toggleSentence',data:{sentenceId,enabled,typeofEnabled:typeof enabled,configValue:this.sentenceConfig[sentenceId]},timestamp:Date.now(),hypothesisId:'H1'})}).catch(()=>{});
-          // #endregion
           const interval = this.getSentenceIntervalForId(sentenceId);
           this.queueSentenceChange(sentenceId, enabled, interval);
         },
@@ -3774,6 +3774,13 @@
             this.sentenceConfigSuccess = false;
           }
         }
+      },
+      created() {
+        // Non-reactive: recent raw messages aren't rendered, so Vue needn't
+        // track them (they change ~50 times a second).
+        this.messages = [];
+        this._nmeaBuffer = [];
+        this._nmeaFlushTimer = null;
       },
       mounted() {
         // Load unit preference from localStorage
