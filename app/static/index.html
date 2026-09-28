@@ -800,10 +800,10 @@
                         <!-- 2a: BlueOS serial-port mapping (manual). -->
                         <div class="text-overline mb-2">2a &mdash; BlueOS Autopilot Firmware &rarr; Serial port configuration</div>
                         <div class="text-caption grey--text mb-3">
-                          Pick two unused SERIAL slots and paste one <code>udpin</code>
-                          string into each. Then click <strong>Save and Restart</strong>.
-                          Note which SERIAL numbers you use &mdash; you enter the same
-                          numbers in step&nbsp;2b.
+                          Paste the wind string into <strong>SERIAL{{ recommendedWindSerial }}</strong>
+                          and the GPS + heading string into <strong>SERIAL{{ recommendedGpsSerial }}</strong>.
+                          You only need the one(s) you plan to use. Then click
+                          <strong>Save and Restart</strong>.
                         </div>
                         <div class="d-flex flex-wrap align-center mb-3" style="gap: 12px;">
                           <div class="d-flex align-center" style="gap: 6px;">
@@ -843,9 +843,11 @@
                         <!-- 2b: extension applies the ArduPilot parameters. -->
                         <div class="text-overline mb-2">2b &mdash; Apply ArduRover parameters</div>
                         <div class="text-caption grey--text mb-3">
-                          Enter the SERIAL numbers you used in step&nbsp;2a. Clicking
-                          Apply writes and verifies the matching ArduPilot parameters
-                          via mavlink2rest. The Airmar is wired as
+                          Pick the SERIAL port you used in step&nbsp;2a for each stream,
+                          or <em>Not used</em> to skip it &mdash; you can set up wind only,
+                          GPS only, or both. Clicking Apply writes and verifies the
+                          matching ArduPilot parameters via mavlink2rest; parameters for
+                          a stream set to <em>Not used</em> are left untouched. For GPS, the Airmar is wired as
                           <code>GPS2_TYPE&nbsp;=&nbsp;5</code>&nbsp;(NMEA); the vehicle's onboard
                           GPS stays on <code>GPS1_TYPE&nbsp;=&nbsp;1</code>&nbsp;(AUTO) so the
                           stock u-Blox keeps working. If parameters drift later,
@@ -854,10 +856,10 @@
 
                         <v-row dense>
                           <v-col cols="12" md="6">
-                            <div class="text-caption font-weight-medium mb-1">Wind serial (SERIAL X)</div>
+                            <div class="text-caption font-weight-medium mb-1">Wind serial (use SERIAL{{ recommendedWindSerial }})</div>
                             <v-select
                               v-model="autopilotSetupForm.wind_serial"
-                              :items="serialIndexOptions"
+                              :items="windSerialOptions"
                               :disabled="autopilotBusy"
                               dense
                               outlined
@@ -865,10 +867,10 @@
                             ></v-select>
                           </v-col>
                           <v-col cols="12" md="6">
-                            <div class="text-caption font-weight-medium mb-1">GPS + heading serial (SERIAL Y)</div>
+                            <div class="text-caption font-weight-medium mb-1">GPS + heading serial (use SERIAL{{ recommendedGpsSerial }})</div>
                             <v-select
                               v-model="autopilotSetupForm.gps_serial"
-                              :items="serialIndexOptions"
+                              :items="gpsSerialOptions"
                               :disabled="autopilotBusy"
                               dense
                               outlined
@@ -879,7 +881,7 @@
 
                         <v-checkbox
                           v-model="autopilotSetupForm.use_gps_yaw_fallback"
-                          :disabled="autopilotBusy"
+                          :disabled="autopilotBusy || !autopilotSetupForm.gps_serial"
                           dense
                           hide-details
                           class="mt-3"
@@ -1994,10 +1996,11 @@
         },
         // Local edit state for the setup form (not applied until user clicks).
         autopilotSetupForm: {
-          wind_serial: null,
-          gps_serial: null,
+          wind_serial: 0,   // 0 = Not used
+          gps_serial: 0,
           use_gps_yaw_fallback: false
         },
+        autopilotSetupFormSeeded: false,
         autopilotBusy: false,
         autopilotSetupMessage: '',
         autopilotSetupOk: true,
@@ -2123,14 +2126,20 @@
       },
       computed: {
         // ── ArduRover setup helpers ──────────────────────────────────
-        serialIndexOptions() {
-          const lo = this.autopilotSetup.min_serial_index || 1;
-          const hi = this.autopilotSetup.max_serial_index || 9;
-          const out = [];
-          for (let i = lo; i <= hi; i++) {
-            out.push({ text: 'SERIAL' + i, value: i });
-          }
-          return out;
+        // Setup directs operators to SERIAL6 (wind) and SERIAL7 (GPS). The
+        // value 0 means "Not used" (Vuetify selects can't hold null items);
+        // it is sent to the API as null.
+        recommendedWindSerial() {
+          return this.autopilotSetup.recommended_wind_serial || 6;
+        },
+        recommendedGpsSerial() {
+          return this.autopilotSetup.recommended_gps_serial || 7;
+        },
+        windSerialOptions() {
+          return this.serialOptionsFor(this.autopilotSetup.wind_serial);
+        },
+        gpsSerialOptions() {
+          return this.serialOptionsFor(this.autopilotSetup.gps_serial);
         },
         udpinWindString() {
           return this.autopilotSetup.udpin_wind_string || 'udpin:0.0.0.0:27001';
@@ -2141,12 +2150,12 @@
         autopilotSetupSameSerialError() {
           const a = this.autopilotSetupForm.wind_serial;
           const b = this.autopilotSetupForm.gps_serial;
-          return a != null && b != null && a === b;
+          return !!a && !!b && a === b;
         },
         autopilotSetupFormValid() {
           const a = this.autopilotSetupForm.wind_serial;
           const b = this.autopilotSetupForm.gps_serial;
-          return !this.autopilotBusy && Number.isInteger(a) && Number.isInteger(b) && a !== b;
+          return !this.autopilotBusy && (!!a || !!b) && !this.autopilotSetupSameSerialError;
         },
         autopilotSetupScreenshotSrc() {
           return '/static/images/blueos-serial-config.png';
@@ -2154,8 +2163,11 @@
         // Shown while a UDP route is ticked but the ArduRover setup has not
         // been applied, or has drifted since it was applied.
         streamSetupHintVisible() {
-          if (!this.streamWind && !this.streamGps) return false;
-          return !this.autopilotSetup.applied || this.autopilotDriftBannerVisible;
+          const applied = this.autopilotSetup.applied;
+          const windMissing = this.streamWind && !(applied && this.autopilotSetup.wind_serial != null);
+          const gpsMissing = this.streamGps && !(applied && this.autopilotSetup.gps_serial != null);
+          if (windMissing || gpsMissing) return true;
+          return (this.streamWind || this.streamGps) && this.autopilotDriftBannerVisible;
         },
         autopilotDriftBannerVisible() {
           return this.autopilotSetup.applied &&
@@ -2335,6 +2347,9 @@
         },
         // Refresh logs info when switching to Logs tab; load history on Dashboard
         activeTab(newVal) {
+          if (newVal === 3) {  // Sentences tab — show current device rates
+            this.fetchSentences();
+          }
           if (newVal === 4) {  // Logs tab index
             this.fetchLogsInfo();
           }
@@ -3238,17 +3253,14 @@
           merged.expected = data.expected || {};
           if (!Array.isArray(merged.drift)) merged.drift = merged.drift || [];
           this.autopilotSetup = merged;
-          // Seed the form with the persisted selection on first load so the
-          // user sees what was applied before, not blank selects.
-          if (this.autopilotSetupForm.wind_serial == null && data.wind_serial != null) {
-            this.autopilotSetupForm.wind_serial = data.wind_serial;
-          }
-          if (this.autopilotSetupForm.gps_serial == null && data.gps_serial != null) {
-            this.autopilotSetupForm.gps_serial = data.gps_serial;
-          }
-          if (typeof data.use_gps_yaw_fallback === 'boolean' &&
-              this.autopilotSetupForm.use_gps_yaw_fallback === false) {
-            this.autopilotSetupForm.use_gps_yaw_fallback = data.use_gps_yaw_fallback;
+          // Seed the form once with the persisted selection so the user
+          // sees what was applied before; later merges must not overwrite
+          // an in-progress edit (including an explicit "Not used").
+          if (!this.autopilotSetupFormSeeded) {
+            this.autopilotSetupFormSeeded = true;
+            this.autopilotSetupForm.wind_serial = data.wind_serial || 0;
+            this.autopilotSetupForm.gps_serial = data.gps_serial || 0;
+            this.autopilotSetupForm.use_gps_yaw_fallback = !!data.use_gps_yaw_fallback;
           }
         },
         async fetchAutopilotSetup() {
@@ -3263,9 +3275,10 @@
           this.autopilotSetupMessage = '';
           try {
             const r = await axios.post('/api/autopilot/setup', {
-              wind_serial: this.autopilotSetupForm.wind_serial,
-              gps_serial: this.autopilotSetupForm.gps_serial,
-              use_gps_yaw_fallback: !!this.autopilotSetupForm.use_gps_yaw_fallback
+              wind_serial: this.autopilotSetupForm.wind_serial || null,
+              gps_serial: this.autopilotSetupForm.gps_serial || null,
+              use_gps_yaw_fallback: !!this.autopilotSetupForm.gps_serial &&
+                                    !!this.autopilotSetupForm.use_gps_yaw_fallback
             });
             this.autopilotSetupOk = !!r.data.success;
             this.autopilotSetupMessage = this.formatSetupResultMessage(r.data);
@@ -3366,6 +3379,18 @@
             done();
           }
         },
+        serialOptionsFor(persisted) {
+          const out = [{ text: 'Not used', value: 0 }];
+          for (const i of [this.recommendedWindSerial, this.recommendedGpsSerial]) {
+            out.push({ text: 'SERIAL' + i, value: i });
+          }
+          // Keep a previously applied non-standard slot selectable so an
+          // older setup still shows what was written.
+          if (persisted && !out.some(o => o.value === persisted)) {
+            out.push({ text: 'SERIAL' + persisted + ' (current)', value: persisted });
+          }
+          return out;
+        },
         openAutopilotSetup() {
           this.activeTab = 0;  // Setup tab
           // Wait for the tab transition to render before scrolling.
@@ -3380,6 +3405,8 @@
             const response = await axios.post('/api/stream/routes', { [route]: !!enabled });
             if (response.data.success) {
               this.applyStreamStatus(response.data);
+              // Toggling GPS changes the GPS sentence rates on the device.
+              if (route === 'gps') this.fetchSentences();
             } else {
               console.error('Error updating stream route:', response.data.message);
               await this.checkStreamingStatus();
@@ -3563,8 +3590,18 @@
             const response = await axios.get('/api/sentences');
             this.sentences = response.data.sentences;
             const saved = response.data.saved_config || {};
-            // Use saved config (persisted across restarts) when present, else defaults
+            const device = response.data.device_config || {};
+            // Prefer what the device is running this session, then the saved
+            // config (persisted across restarts), then defaults.
             this.sentences.forEach(sentence => {
+              const pending = this.pendingSentenceChanges || {};
+              if (sentence.id in pending) return;  // don't clobber an in-progress edit
+              const d = device[sentence.id];
+              if (d && typeof d.interval === 'number') {
+                this.$set(this.sentenceIntervals, sentence.id, d.interval / 10);
+                if (typeof d.enabled === 'boolean') this.$set(this.sentenceConfig, sentence.id, d.enabled);
+                return;
+              }
               const s = saved[sentence.id];
               if (s && typeof s.enabled === 'boolean') {
                 this.$set(this.sentenceConfig, sentence.id, s.enabled);

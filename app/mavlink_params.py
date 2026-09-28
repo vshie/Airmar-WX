@@ -227,6 +227,10 @@ def pick_autopilot(vehicles, prefer_mavtypes=None):
 # USB console; refusing it prevents accidentally breaking the GCS link.
 MIN_SERIAL_INDEX = 1
 MAX_SERIAL_INDEX = 9
+# The SERIAL slots the setup UI directs operators to: wind on SERIAL6,
+# GPS + heading on SERIAL7. The API still accepts the full range above.
+RECOMMENDED_WIND_SERIAL = 6
+RECOMMENDED_GPS_SERIAL = 7
 
 # Serial protocol enum values (see AP_SerialManager::SerialProtocol).
 SERIAL_PROTOCOL_GPS = 5
@@ -254,8 +258,13 @@ EK3_VELXY_GPS = 3
 
 def validate_selection(wind_serial: Optional[int],
                        gps_serial: Optional[int]) -> Tuple[bool, str]:
-    """Guard: both must be integers in range and distinct."""
+    """Guard: at least one route selected; each selected index an in-range
+    integer; distinct when both are selected. `None` means "not used"."""
+    if wind_serial is None and gps_serial is None:
+        return False, "select a SERIAL port for wind, GPS, or both"
     for role, value in (('wind_serial', wind_serial), ('gps_serial', gps_serial)):
+        if value is None:
+            continue
         if not isinstance(value, int) or isinstance(value, bool):
             return False, f"{role} must be an integer SERIAL index"
         if value < MIN_SERIAL_INDEX or value > MAX_SERIAL_INDEX:
@@ -268,10 +277,15 @@ def validate_selection(wind_serial: Optional[int],
     return True, ''
 
 
-def build_expected_params(wind_serial: int,
-                          gps_serial: int,
+def build_expected_params(wind_serial: Optional[int],
+                          gps_serial: Optional[int],
                           use_gps_yaw_fallback: bool = False) -> Dict[str, float]:
     """Return the {param_name: value} we want ArduPilot to end up with.
+
+    Either route may be `None` ("not used"): its params are then left
+    untouched, so a wind-only or GPS-only setup never writes the other
+    driver's parameters. The yaw fallback is a GPS-route option and is
+    ignored without a GPS serial.
 
     GPS contract (as of 1.1.6):
     * `GPS1_TYPE = 1` (AUTO) — leave the BlueBoat's onboard u-Blox as
@@ -286,22 +300,26 @@ def build_expected_params(wind_serial: int,
     driver into NMEA mode and disabled the onboard u-Blox. Migration in
     `main.py` upgrades old persisted `autopilot_setup` snapshots.
     """
-    exp: Dict[str, float] = {
-        # Wind serial X
-        f'SERIAL{wind_serial}_PROTOCOL': float(SERIAL_PROTOCOL_WINDVANE),
-        'WNDVN_TYPE': float(WNDVN_TYPE_NMEA),
-        'WNDVN_SPEED_TYPE': float(WNDVN_TYPE_NMEA),
-        # GPS serial Y (Airmar → GPS2)
-        f'SERIAL{gps_serial}_PROTOCOL': float(SERIAL_PROTOCOL_GPS),
-        'GPS1_TYPE': float(GPS_TYPE_AUTO),
-        'GPS2_TYPE': float(GPS_TYPE_NMEA),
-        # Secondary EKF source set — full alternate GPS-yaw set
-        'EK3_SRC2_YAW': float(EK3_YAW_GPS),
-        'EK3_SRC2_POSXY': float(EK3_POSXY_GPS),
-        'EK3_SRC2_VELXY': float(EK3_VELXY_GPS),
-    }
-    if use_gps_yaw_fallback:
-        exp['EK3_SRC1_YAW'] = float(EK3_YAW_GPS_WITH_COMPASS_FALLBACK)
+    exp: Dict[str, float] = {}
+    if wind_serial is not None:
+        exp.update({
+            f'SERIAL{wind_serial}_PROTOCOL': float(SERIAL_PROTOCOL_WINDVANE),
+            'WNDVN_TYPE': float(WNDVN_TYPE_NMEA),
+            'WNDVN_SPEED_TYPE': float(WNDVN_TYPE_NMEA),
+        })
+    if gps_serial is not None:
+        exp.update({
+            # GPS serial Y (Airmar → GPS2)
+            f'SERIAL{gps_serial}_PROTOCOL': float(SERIAL_PROTOCOL_GPS),
+            'GPS1_TYPE': float(GPS_TYPE_AUTO),
+            'GPS2_TYPE': float(GPS_TYPE_NMEA),
+            # Secondary EKF source set — full alternate GPS-yaw set
+            'EK3_SRC2_YAW': float(EK3_YAW_GPS),
+            'EK3_SRC2_POSXY': float(EK3_POSXY_GPS),
+            'EK3_SRC2_VELXY': float(EK3_VELXY_GPS),
+        })
+        if use_gps_yaw_fallback:
+            exp['EK3_SRC1_YAW'] = float(EK3_YAW_GPS_WITH_COMPASS_FALLBACK)
     return exp
 
 
@@ -860,6 +878,8 @@ __all__ = [
     'DEFAULT_BASE_URL',
     'MIN_SERIAL_INDEX',
     'MAX_SERIAL_INDEX',
+    'RECOMMENDED_WIND_SERIAL',
+    'RECOMMENDED_GPS_SERIAL',
     'SERIAL_PROTOCOL_GPS',
     'SERIAL_PROTOCOL_WINDVANE',
     'WNDVN_TYPE_NMEA',

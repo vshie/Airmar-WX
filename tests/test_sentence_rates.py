@@ -61,14 +61,82 @@ class RequiredSentenceTests(unittest.TestCase):
                 f"{sid} must be in REQUIRED_SENTENCES for GPS driver",
             )
 
-    def test_high_baud_gps_interval_is_10hz(self):
-        """At 115200 baud the four GPS-family sentences are 10 Hz."""
+    def test_high_baud_gps_interval_is_10hz_when_gps_stream_on(self):
+        """At 115200 baud with the GPS route ticked, GPS sentences are 10 Hz."""
+        self.handler.state['stream_gps'] = True
         for sid in ('GGA', 'RMC', 'VTG', 'HDT'):
             got = self.handler._required_interval_for(sid, 115200)
             self.assertEqual(
                 got, 1,
                 f"{sid} @ 115200 must be interval 1 tenths (10 Hz), got {got}",
             )
+
+    def test_gps_interval_is_1hz_when_gps_stream_off(self):
+        """Without the GPS route nothing needs 10 Hz, even at 115200."""
+        self.handler.state['stream_gps'] = False
+        for sid in ('GGA', 'RMC', 'VTG', 'HDT'):
+            self.assertEqual(self.handler._required_interval_for(sid, 115200), 10)
+
+    def test_toggling_gps_stream_rewrites_device_rate(self):
+        """Ticking / unticking the GPS route pushes the new rate to the device
+        and records it in sentence_config."""
+        writes = []
+
+        class _FakeSerial:
+            is_open = True
+            baudrate = 115200
+            port = '/dev/ttyUSB1'
+
+            def write(self, data):
+                writes.append(data.decode())
+
+        self.handler.serial_connection = _FakeSerial()
+        self.handler.state['stream_gps'] = False
+        with mock.patch.object(self.handler, '_create_udp_socket', return_value=mock.Mock()), \
+                mock.patch('time.sleep'):
+            self.handler.set_stream_routes(gps=True)
+            self.assertEqual(
+                sorted(w.split('*')[0] for w in writes),
+                [f'$PAMTC,EN,{sid},1,1' for sid in ('GGA', 'HDT', 'RMC', 'VTG')],
+            )
+            self.assertEqual(self.handler.state['sentence_config']['GGA']['interval'], 1)
+            writes.clear()
+            self.handler.set_stream_routes(gps=False)
+            self.assertEqual(
+                sorted(w.split('*')[0] for w in writes),
+                [f'$PAMTC,EN,{sid},1,10' for sid in ('GGA', 'HDT', 'RMC', 'VTG')],
+            )
+            # Wind-only toggles must not touch the GPS sentence rate.
+            writes.clear()
+            self.handler.set_stream_routes(wind=True)
+            self.assertEqual(writes, [])
+        self.handler.serial_connection = None
+
+    def test_device_config_reports_rates_set_at_connect(self):
+        """Regression: the Sentences tab showed 1 Hz for GPS sentences that
+        the device was running at 10 Hz, because rates written by
+        enable_required_sentences were never recorded anywhere the UI read."""
+        class _FakeSerial:
+            is_open = True
+            baudrate = 115200
+            port = '/dev/ttyUSB1'
+
+            def write(self, data):
+                pass
+
+        self.handler.serial_connection = _FakeSerial()
+        self.handler.state['stream_gps'] = True
+        self.handler.state['sentence_config'] = {}
+        with mock.patch('time.sleep'):
+            ok, _ = self.handler.enable_required_sentences()
+        self.assertTrue(ok)
+        dev = self.handler.device_sentence_config
+        for sid in ('GGA', 'RMC', 'VTG', 'HDT'):
+            self.assertEqual(dev[sid], {'enabled': True, 'interval': 1})
+        self.assertEqual(dev['MWVR']['interval'], 10)
+        # Saved (user) config is untouched by the connect-time defaults.
+        self.assertEqual(self.handler.state['sentence_config'], {})
+        self.handler.serial_connection = None
 
     def test_high_baud_leaves_non_gps_alone(self):
         """Wind + weather sentences stay at the class-dict default at
@@ -81,7 +149,9 @@ class RequiredSentenceTests(unittest.TestCase):
         )
 
     def test_low_baud_forces_1hz_on_gps_family(self):
-        """At 4800 baud the override is off so bandwidth stays safe."""
+        """At 4800 baud the override is off so bandwidth stays safe,
+        even with the GPS route ticked."""
+        self.handler.state['stream_gps'] = True
         for sid in ('GGA', 'RMC', 'VTG', 'HDT'):
             got = self.handler._required_interval_for(sid, 4800)
             self.assertEqual(

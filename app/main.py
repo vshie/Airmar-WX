@@ -40,6 +40,8 @@ try:
         ParamClient,
         MIN_SERIAL_INDEX as _MIN_SERIAL_INDEX,
         MAX_SERIAL_INDEX as _MAX_SERIAL_INDEX,
+        RECOMMENDED_WIND_SERIAL as _RECOMMENDED_WIND_SERIAL,
+        RECOMMENDED_GPS_SERIAL as _RECOMMENDED_GPS_SERIAL,
         build_expected_params,
         diff_current_vs_expected,
         snapshot_from_apply_result,
@@ -88,8 +90,10 @@ class NMEAHandler:
     REQUIRED_SENTENCES = ['MWVR', 'MWVT', 'MWD', 'HDT', 'VTG', 'ROT', 'ZDA',
                           'GGA', 'RMC']
 
-    # PAMTC,EN interval override for the ArduPilot GPS sentences when we
-    # are at the operating baud (115200). Value is tenths-of-seconds per
+    # PAMTC,EN interval override for the ArduPilot GPS sentences when the
+    # GPS + heading UDP route is enabled AND we are at the operating baud
+    # (115200). Without the route they stay at 1 Hz: nothing needs them
+    # faster, and 10 Hz inflates the NMEA log. Value is tenths-of-seconds per
     # the WX manual, so `1` = 0.1 s = 10 Hz. ArduPilot's NMEA GPS driver
     # is happier at 5-10 Hz (EKF3 innovation rejects sluggish GPS), and
     # 4 sentences x 82 chars x 10 Hz = ~26 kbps, well under 115200 baud
@@ -261,6 +265,14 @@ class NMEAHandler:
         # to 115200 is not supported on the 200WX (max 38400), so we surface a UI
         # notice when an older WX model is detected.
         self.device_info = None
+
+        # What the device is running this session, per sentence:
+        # { sentence_id: {"enabled": bool, "interval": int (tenths)} }.
+        # Updated on every PAMTC,EN we send and every PAMTC,EN,Q response,
+        # so the Sentences tab shows real rates (e.g. the 10 Hz GPS set at
+        # connect) rather than the saved config or 1 Hz defaults. Not
+        # persisted; cleared on disconnect.
+        self.device_sentence_config = {}
         
         self.state = {
             'port': None,
@@ -585,7 +597,8 @@ class NMEAHandler:
         # NMEA (5), OR GPS2_TYPE simply missing while a full apply was
         # persisted. Either one means "regenerate on next apply".
         legacy_gps1_nmea = expected.get('GPS1_TYPE') == 5.0
-        missing_gps2 = 'GPS2_TYPE' not in expected
+        # A wind-only setup (gps_serial None) legitimately has no GPS params.
+        missing_gps2 = setup.get('gps_serial') is not None and 'GPS2_TYPE' not in expected
         if not (legacy_gps1_nmea or missing_gps2):
             return
         self.app_logger.info(
@@ -1308,6 +1321,7 @@ class NMEAHandler:
         """
         try:
             was_streaming = self.is_streaming
+            gps_before = bool(self.state.get('stream_gps'))
             if wind is not None:
                 if bool(wind) and not self.state.get('stream_wind'):
                     self.streamed_wind_messages = 0
@@ -1325,6 +1339,8 @@ class NMEAHandler:
                 self.udp_socket.close()
                 self.udp_socket = None
             self.save_state()
+            if bool(self.state['stream_gps']) != gps_before:
+                self._apply_gps_sentence_rate()
             self.app_logger.info(
                 "UDP streaming — source %s:%d; wind %s → %s:%d %s; gps %s → %s:%d %s",
                 self.UDP_HOST, self.UDP_SOURCE_PORT,
@@ -1447,6 +1463,8 @@ class NMEAHandler:
             'last_apply_result': setup.get('last_apply_result') or {},
             'min_serial_index': _MIN_SERIAL_INDEX if HAS_MAVLINK_PARAMS else 1,
             'max_serial_index': _MAX_SERIAL_INDEX if HAS_MAVLINK_PARAMS else 9,
+            'recommended_wind_serial': _RECOMMENDED_WIND_SERIAL if HAS_MAVLINK_PARAMS else 6,
+            'recommended_gps_serial': _RECOMMENDED_GPS_SERIAL if HAS_MAVLINK_PARAMS else 7,
             'udp_wind_port': self.UDP_WIND_PORT,
             'udp_gps_port': self.UDP_GPS_PORT,
             'udpin_wind_string': f'udpin:0.0.0.0:{self.UDP_WIND_PORT}',
@@ -1479,8 +1497,9 @@ class NMEAHandler:
         that turned out to be unreliable across mavlink2rest builds and
         caused every apply to look like it did nothing.
         """
+        use_gps_yaw_fallback = bool(use_gps_yaw_fallback) and gps_serial is not None
         expected = build_expected_params(
-            int(wind_serial), int(gps_serial), bool(use_gps_yaw_fallback),
+            wind_serial, gps_serial, use_gps_yaw_fallback,
         )
         result = self._param_client.apply_expected(expected)
         # Snapshot covers every param whose POST succeeded, so the drift
@@ -1490,9 +1509,9 @@ class NMEAHandler:
         posted_any = any(row.get('ok') for row in result.values())
         setup = self.state.get('autopilot_setup') or {}
         setup.update({
-            'wind_serial': int(wind_serial),
-            'gps_serial': int(gps_serial),
-            'use_gps_yaw_fallback': bool(use_gps_yaw_fallback),
+            'wind_serial': wind_serial,
+            'gps_serial': gps_serial,
+            'use_gps_yaw_fallback': use_gps_yaw_fallback,
             'applied': bool(posted_any),
             'ignore_drift': False,
             'expected': snapshot,
@@ -1507,7 +1526,7 @@ class NMEAHandler:
             action = row.get('action') or 'failed'
             counts[action] = counts.get(action, 0) + 1
         self.app_logger.info(
-            "ArduRover setup applied: wind=SERIAL%d gps=SERIAL%d yaw_fallback=%s "
+            "ArduRover setup applied: wind=SERIAL%s gps=SERIAL%s yaw_fallback=%s "
             "counts=%s expected=%s",
             wind_serial, gps_serial, use_gps_yaw_fallback,
             counts, sorted(snapshot.keys()),
@@ -1515,7 +1534,9 @@ class NMEAHandler:
         return result, snapshot
 
     def apply_autopilot_setup(self, wind_serial, gps_serial, use_gps_yaw_fallback):
-        """User-triggered apply for a chosen SERIAL X/Y (+ optional yaw)."""
+        """User-triggered apply for SERIAL X (wind) and/or SERIAL Y (GPS).
+
+        Either index may be None to leave that route's params untouched."""
         if not HAS_MAVLINK_PARAMS or self._param_client is None:
             return False, 'mavlink parameter client not available', {}
         ok, err = validate_selection(wind_serial, gps_serial)
@@ -2105,19 +2126,44 @@ class NMEAHandler:
     def _required_interval_for(self, sentence_id, baud_rate):
         """Return the PAMTC,EN interval (tenths-of-seconds) for one sentence.
 
-        At the operating baud (115200), GPS sentences that feed the
-        ArduPilot NMEA GPS driver are stepped up to 10 Hz so EKF3's GPS
-        source stays responsive. Everything else uses the class-dict
-        `default_interval` (1 Hz). At 4800 baud all sentences fall back
-        to 1 Hz to stay under the bus ceiling.
+        When the GPS + heading UDP route is enabled and we are at the
+        operating baud (115200), GPS sentences that feed the ArduPilot NMEA
+        GPS driver are stepped up to 10 Hz so EKF3's GPS source stays
+        responsive. Everything else uses the class-dict `default_interval`
+        (1 Hz). At 4800 baud all sentences stay at 1 Hz to stay under the
+        bus ceiling.
         """
         config = self.SUPPORTED_SENTENCES.get(sentence_id, {})
         default_tenths = int(config.get('default_interval', 10))
-        if baud_rate == self.OPERATING_BAUD_RATE:
+        if baud_rate == self.OPERATING_BAUD_RATE and self.state.get('stream_gps'):
             override = self.HIGH_BAUD_GPS_HZ_OVERRIDE_TENTHS.get(sentence_id)
             if override is not None:
                 return int(override)
         return default_tenths
+
+    def _apply_gps_sentence_rate(self):
+        """Write the GPS-family sentence rate that matches `stream_gps`.
+
+        Goes through `configure_sentences_batch` so `sentence_config` (and
+        therefore the Sentences tab and the next reconnect) agree with what
+        the device is doing. No-op when not connected.
+        """
+        if not self.serial_connection or not self.serial_connection.is_open:
+            return True, "Not connected; rate applies on next connect"
+        baud = self.serial_connection.baudrate
+        changes = [
+            {'sentence_id': sid, 'enabled': True,
+             'interval': self._required_interval_for(sid, baud)}
+            for sid in sorted(self.HIGH_BAUD_GPS_HZ_OVERRIDE_TENTHS)
+        ]
+        ok, msg = self.configure_sentences_batch(changes)
+        hz = 10.0 / max(changes[0]['interval'], 1)
+        self.app_logger.info(
+            "GPS sentences %s set to %.0f Hz (stream_gps=%s, %d baud): %s",
+            ",".join(c['sentence_id'] for c in changes), hz,
+            bool(self.state.get('stream_gps')), baud, msg,
+        )
+        return ok, msg
 
     def enable_required_sentences(self):
         """
@@ -2153,6 +2199,7 @@ class NMEAHandler:
                     sentence_id, interval, 10.0 / max(interval, 1),
                 )
                 self.serial_connection.write(cmd)
+                self.device_sentence_config[sentence_id] = {'enabled': True, 'interval': interval}
                 time.sleep(0.2)
                 enabled_count += 1
                 if interval == 1:
@@ -2202,6 +2249,7 @@ class NMEAHandler:
             with self._serial_lock:
                 self.serial_connection.write(cmd)
                 time.sleep(0.2)
+            self.device_sentence_config[sentence_id] = {'enabled': enabled, 'interval': interval}
             
             if 'sentence_config' not in self.state:
                 self.state['sentence_config'] = {}
@@ -2247,6 +2295,7 @@ class NMEAHandler:
                     cmd = self._nmea_cmd(f'PAMTC,EN,{sentence_id},{enable_flag},{interval}')
                     try:
                         self.serial_connection.write(cmd)
+                        self.device_sentence_config[sentence_id] = {'enabled': enabled, 'interval': interval}
                         if 'sentence_config' not in self.state:
                             self.state['sentence_config'] = {}
                         self.state['sentence_config'][sentence_id] = {'enabled': enabled, 'interval': interval}
@@ -2460,6 +2509,7 @@ class NMEAHandler:
                 pass
             # #endregion
             if config:
+                self.device_sentence_config.update(config)
                 return True, config
             else:
                 return False, "No configuration response received"
@@ -2554,6 +2604,7 @@ class NMEAHandler:
                 return False, self.connection_message
 
             self.detected_baud = None
+            self.device_sentence_config = {}
             op = self.OPERATING_BAUD_RATE
             if stay_at_4800:
                 baud_rates = [4800]
@@ -2632,6 +2683,10 @@ class NMEAHandler:
                             apply_ok, _ = self.configure_sentences_batch(changes)
                             if apply_ok:
                                 self.app_logger.debug("Restored saved sentence config to device")
+                    # The GPS route's rate requirement wins over a saved
+                    # per-sentence interval (ArduPilot needs ~10 Hz).
+                    if self.state.get('stream_gps'):
+                        self._apply_gps_sentence_rate()
                     
                     # Start the reader thread
                     self.start_reader_thread()
@@ -2690,6 +2745,7 @@ class NMEAHandler:
             self.messages_received = 0
             self.detected_baud = None
             self.device_info = None
+            self.device_sentence_config = {}
             self._set_conn_status(self.CONN_STATUS_DISCONNECTED, '')
             self.save_state()
             self._sse_broadcast('connection', self.get_connection_info())
@@ -2985,7 +3041,9 @@ def get_sentences():
     return jsonify({
         "sentences": nmea_handler.get_sentences_info(),
         "connected": nmea_handler.serial_connection is not None and nmea_handler.serial_connection.is_open,
-        "saved_config": nmea_handler.state.get('sentence_config') or {}
+        "saved_config": nmea_handler.state.get('sentence_config') or {},
+        # What the device is running this session (preferred by the UI).
+        "device_config": nmea_handler.device_sentence_config,
     })
 
 @app.route('/api/sentences/configure', methods=['POST'])
@@ -3252,8 +3310,10 @@ def get_autopilot_setup():
 def post_autopilot_setup():
     """Apply the ArduRover parameter setup for the chosen SERIAL X/Y.
 
-    Body: { "wind_serial": int, "gps_serial": int,
+    Body: { "wind_serial": int|null, "gps_serial": int|null,
             "use_gps_yaw_fallback": bool (optional, default false) }
+    At least one of wind_serial / gps_serial is required; null means that
+    route is not configured.
     """
     data = request.get_json(silent=True) or {}
     wind_serial = data.get('wind_serial')

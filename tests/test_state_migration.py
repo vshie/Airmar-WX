@@ -152,6 +152,35 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(setup['expected'], {})
             self.assertFalse(setup['applied'])
 
+    def test_gps_contract_migration_skips_wind_only_setup(self):
+        """A wind-only setup has no GPS params by design and must survive
+        load_state untouched (it would otherwise be wiped every restart)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir) / 'logs'
+            log_dir.mkdir()
+            main = _load_main(log_dir)
+            state_path = Path(tmpdir) / 'state.json'
+            expected = {'SERIAL6_PROTOCOL': 21.0, 'WNDVN_TYPE': 4.0, 'WNDVN_SPEED_TYPE': 4.0}
+            state_path.write_text(json.dumps({
+                'stream_wind': True, 'stream_gps': False,
+                'autopilot_setup': {
+                    'wind_serial': 6, 'gps_serial': None,
+                    'use_gps_yaw_fallback': False,
+                    'applied': True, 'ignore_drift': False,
+                    'expected': expected, 'last_apply_result': {},
+                },
+            }))
+            handler = main.nmea_handler
+            handler.state_path = state_path
+            handler.state = {
+                'port': None, 'baud_rate': 4800, 'stay_at_4800': False,
+                'is_streaming': False, 'sentence_config': {}, 'autopilot_setup': {},
+            }
+            handler.load_state()
+            setup = handler.state['autopilot_setup']
+            self.assertEqual(setup['expected'], expected)
+            self.assertTrue(setup['applied'])
+
     def test_gps_contract_migration_noop_for_new_snapshots(self):
         """Snapshots that already conform to the two-GPS contract must
         be left alone — no re-writes, no cleared ignore_drift."""
@@ -241,6 +270,50 @@ class StreamRouteMigrationTests(unittest.TestCase):
         self.assertTrue(h.state['stream_wind'])
         self.assertFalse(h.state['stream_gps'])
         self.assertTrue(h.is_streaming)
+
+
+class PartialApplyTests(unittest.TestCase):
+    """Step 2b: wind-only / GPS-only applies write and persist one route."""
+
+    def test_wind_only_apply_persists_null_gps(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log_dir = Path(tmp.name) / 'logs'
+        log_dir.mkdir()
+        main = _load_main(log_dir)
+        handler = main.nmea_handler
+        handler.state_path = Path(tmp.name) / 'state.json'
+        handler.state['autopilot_setup'] = {}
+        written = {}
+
+        class _FakeParamClient:
+            def apply_expected(self, expected):
+                written.update(expected)
+                return {k: {'ok': True, 'target': v, 'action': 'wrote'}
+                        for k, v in expected.items()}
+
+        handler._param_client = _FakeParamClient()
+        ok, msg, payload = handler.apply_autopilot_setup(6, None, True)
+        self.assertTrue(ok, msg)
+        self.assertEqual(set(written), {'SERIAL6_PROTOCOL', 'WNDVN_TYPE', 'WNDVN_SPEED_TYPE'})
+        status = payload['status']
+        self.assertEqual(status['wind_serial'], 6)
+        self.assertIsNone(status['gps_serial'])
+        # Yaw fallback is a GPS option; it must not stick on a wind-only setup.
+        self.assertFalse(status['use_gps_yaw_fallback'])
+        saved = json.loads(handler.state_path.read_text())
+        self.assertIsNone(saved['autopilot_setup']['gps_serial'])
+
+    def test_apply_with_no_route_is_rejected(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log_dir = Path(tmp.name) / 'logs'
+        log_dir.mkdir()
+        main = _load_main(log_dir)
+        handler = main.nmea_handler
+        handler._param_client = object()
+        ok, msg, _ = handler.apply_autopilot_setup(None, None, False)
+        self.assertFalse(ok)
 
 if __name__ == '__main__':
     unittest.main()

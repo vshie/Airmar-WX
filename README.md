@@ -81,7 +81,7 @@ When manually installing, paste this into the **Custom settings** field:
 
 The extension can forward NMEA sentences to the autopilot via **two** UDP ports at the same time so both the wind vane driver and the GPS/heading driver can be fed simultaneously (each ArduPilot serial has a single `SERIALx_PROTOCOL`, so one port cannot serve both drivers).
 
-Each route has its own checkbox under **Send to ArduPilot over UDP** in the connection panel, and **both are off by default** — nothing is sent to the autopilot until you tick one. The choice is saved and applies on every connect and restart. Connecting or disconnecting the sensor does not change it. When upgrading from 1.1.9 or earlier, an install that has already applied the ArduRover parameter setup keeps both routes on; otherwise both start off.
+Each route has its own checkbox under **Send to ArduPilot over UDP** in the connection panel, and **both are off by default** — nothing is sent to the autopilot until you tick one. The choice is saved and applies on every connect and restart. Connecting or disconnecting the sensor does not change it. Ticking **GPS + heading** also raises `$GPGGA`, `$GPRMC`, `$GPVTG`, and `$HCHDT` from 1 Hz to the 10 Hz ArduPilot's NMEA GPS driver needs (at 115200 baud only; at 4800 baud they stay at 1 Hz), and unticking it returns them to 1 Hz. When upgrading from 1.1.9 or earlier, an install that has already applied the ArduRover parameter setup keeps both routes on; otherwise both start off.
 
 | Route | UDP port | Sentences | ArduPilot driver |
 |---|---|---|---|
@@ -90,16 +90,16 @@ Each route has its own checkbox under **Send to ArduPilot over UDP** in the conn
 
 ### BlueOS serial port configuration (manual)
 
-Open **BlueOS → Autopilot Firmware → Serial port configuration** and set two unused serial slots to the corresponding `udpin` device string, then Save and Restart the autopilot:
+Open **BlueOS → Autopilot Firmware → Serial port configuration** and set the `udpin` device string for each stream you want, then Save and Restart the autopilot:
 
-- `udpin:0.0.0.0:27001` — the SERIAL port that will act as the wind vane
-- `udpin:0.0.0.0:27002` — the SERIAL port that will act as the GPS/heading source
+- **SERIAL6** → `udpin:0.0.0.0:27001` — wind vane
+- **SERIAL7** → `udpin:0.0.0.0:27002` — GPS/heading source
 
-Do NOT use the same serial index for both, and do NOT overwrite the on-board GPS serial. The extension surfaces both strings with a click-to-copy button under **Setup → Step 2a** next to the serial-config screenshot.
+You only need the one(s) you plan to use. Do NOT overwrite the on-board GPS serial. The extension surfaces both strings with a click-to-copy button under **Setup → Step 2a** next to the serial-config screenshot.
 
 ### ArduRover parameter setup (from the extension)
 
-In **Setup → Step 2b**, pick the two SERIAL indexes you assigned above (e.g. `SERIAL2` and `SERIAL7`) and click **Apply parameters**. The extension writes the following values via mavlink2rest, verified by a fresh `PARAM_VALUE` echo per param:
+In **Setup → Step 2b**, pick the SERIAL port for each stream (`SERIAL6` for wind, `SERIAL7` for GPS), or **Not used** to skip one, and click **Apply parameters**. Wind only, GPS only, or both can be set up; the rows for a stream set to **Not used** are not written. The extension writes the following values via mavlink2rest, verified by a fresh `PARAM_VALUE` echo per param. The first three rows belong to the wind stream, the rest to GPS:
 
 | Param                        | Value | Purpose |
 |---|---|---|

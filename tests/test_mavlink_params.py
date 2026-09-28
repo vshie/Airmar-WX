@@ -44,8 +44,36 @@ class ValidateSelectionTests(unittest.TestCase):
         ok, _ = mp.validate_selection(True, 3)
         self.assertFalse(ok, 'True must not be accepted as SERIAL index')
 
+    def test_single_route_selection_accepted(self):
+        ok, err = mp.validate_selection(6, None)
+        self.assertTrue(ok, err)
+        ok, err = mp.validate_selection(None, 7)
+        self.assertTrue(ok, err)
+
+    def test_no_route_selected_rejected(self):
+        ok, err = mp.validate_selection(None, None)
+        self.assertFalse(ok)
+        self.assertIn('wind, GPS, or both', err)
+
 
 class ExpectedParamsTests(unittest.TestCase):
+    def test_wind_only_writes_no_gps_params(self):
+        exp = mp.build_expected_params(6, None, use_gps_yaw_fallback=True)
+        self.assertEqual(exp, {
+            'SERIAL6_PROTOCOL': 21.0,
+            'WNDVN_TYPE': 4.0,
+            'WNDVN_SPEED_TYPE': 4.0,
+        })
+
+    def test_gps_only_writes_no_wind_params(self):
+        exp = mp.build_expected_params(None, 7, use_gps_yaw_fallback=True)
+        self.assertEqual(exp['SERIAL7_PROTOCOL'], 5.0)
+        self.assertEqual(exp['GPS2_TYPE'], 5.0)
+        self.assertEqual(exp['EK3_SRC1_YAW'], 3.0)
+        for name in ('WNDVN_TYPE', 'WNDVN_SPEED_TYPE'):
+            self.assertNotIn(name, exp)
+        self.assertFalse(any(k.endswith('_PROTOCOL') and k != 'SERIAL7_PROTOCOL' for k in exp))
+
     def test_default_expected_set(self):
         exp = mp.build_expected_params(2, 3, use_gps_yaw_fallback=False)
         # Serial roles per plan.
