@@ -765,7 +765,8 @@
 
             <v-tabs-items v-model="activeTab">
               <!-- Setup Tab -->
-              <v-tab-item>
+              <v-tab-item :transition="false" :reverse-transition="false">
+                <template v-if="activeTab === 0">
                 <v-card-text>
                   <div style="max-width:900px">
 
@@ -1015,10 +1016,12 @@
 
                   </div>
                 </v-card-text>
+                </template>
               </v-tab-item>
 
               <!-- Dashboard Tab -->
-              <v-tab-item>
+              <v-tab-item :transition="false" :reverse-transition="false">
+                <template v-if="activeTab === 1">
                 <v-card-text>
                   <v-alert v-if="!connectionInfo.connected" type="info" dense class="mb-4">
                     Connect to a 300WX WeatherStation to see sensor data.
@@ -1644,10 +1647,12 @@
                     UTC: {{ sensorData.time.utc_date }} {{ sensorData.time.utc_time }}
                   </div>
                 </v-card-text>
+                </template>
               </v-tab-item>
 
               <!-- Raw Messages Tab -->
-              <v-tab-item>
+              <v-tab-item :transition="false" :reverse-transition="false">
+                <template v-if="activeTab === 2">
                 <v-card-text>
                   <div class="terminal">
                     <div v-for="card in latestMessageCards" :key="card.type" class="message-card">
@@ -1676,10 +1681,12 @@
                     </div>
                   </div>
                 </v-card-text>
+                </template>
               </v-tab-item>
 
               <!-- Sentences Tab -->
-              <v-tab-item>
+              <v-tab-item :transition="false" :reverse-transition="false">
+                <template v-if="activeTab === 3">
                 <v-card-text>
                   <div class="d-flex mb-4">
                     <v-btn
@@ -1843,10 +1850,12 @@
                     <span v-else>Loading sentence configuration...</span>
                   </div>
                 </v-card-text>
+                </template>
               </v-tab-item>
 
               <!-- Logs Tab -->
-              <v-tab-item>
+              <v-tab-item :transition="false" :reverse-transition="false">
+                <template v-if="activeTab === 4">
                 <v-card-text>
                   <v-row>
                     <v-col cols="12" md="6">
@@ -1937,6 +1946,7 @@
                     </v-card-text>
                   </v-card>
                 </v-card-text>
+                </template>
               </v-tab-item>
             </v-tabs-items>
           </v-card>
@@ -2575,29 +2585,41 @@
               console.error('Error parsing init SSE:', e);
             }
           });
-          // ~50 messages/s arrive (10 Hz GPS sentences). Applying each one to
-          // reactive state re-rendered the whole single-component app per
-          // message, so buffer them and apply in one batch a few times a second.
+          // ~50 NMEA messages/s arrive (10 Hz GPS sentences) plus sensor_data
+          // at 5 Hz and status at 1 Hz. Every reactive change re-renders the
+          // whole single-component app (~10 ms), and events arriving in
+          // separate tasks each get their own render, so buffer everything and
+          // apply it together a few times a second: one render per flush.
           es.addEventListener('nmea_message', (ev) => {
             try { this._nmeaBuffer.push(JSON.parse(ev.data)); } catch (e) {}
-            if (!this._nmeaFlushTimer) {
-              this._nmeaFlushTimer = setTimeout(() => this.flushNmeaBuffer(), 250);
-            }
+            this.scheduleSseFlush();
           });
           es.addEventListener('sensor_data', (ev) => {
-            try { this.sensorData = JSON.parse(ev.data); } catch (e) {}
+            try { this._ssePending.sensorData = JSON.parse(ev.data); } catch (e) {}
+            this.scheduleSseFlush();
           });
           es.addEventListener('stream_status', (ev) => {
-            try { this.applyStreamStatus(JSON.parse(ev.data)); } catch (e) {}
+            try { this._ssePending.streamStatus = JSON.parse(ev.data); } catch (e) {}
+            this.scheduleSseFlush();
           });
           es.addEventListener('connection', (ev) => {
-            try {
-              this.connectionInfo = JSON.parse(ev.data);
-            } catch (e) {}
+            try { this._ssePending.connection = JSON.parse(ev.data); } catch (e) {}
+            this.scheduleSseFlush();
           });
         },
-        flushNmeaBuffer() {
-          this._nmeaFlushTimer = null;
+        scheduleSseFlush() {
+          if (!this._sseFlushTimer) {
+            this._sseFlushTimer = setTimeout(() => this.flushSseBuffer(), 250);
+          }
+        },
+        flushSseBuffer() {
+          this._sseFlushTimer = null;
+          const pending = this._ssePending;
+          this._ssePending = {};
+          if (pending.connection) this.setConnectionInfo(pending.connection);
+          if (pending.streamStatus) this.applyStreamStatus(pending.streamStatus);
+          if (pending.sensorData) this.sensorData = pending.sensorData;
+
           const batch = this._nmeaBuffer;
           if (!batch.length) return;
           this._nmeaBuffer = [];
@@ -2635,10 +2657,11 @@
           this.latestByType = next;
         },
         stopSse() {
-          if (this._nmeaFlushTimer) {
-            clearTimeout(this._nmeaFlushTimer);
-            this._nmeaFlushTimer = null;
+          if (this._sseFlushTimer) {
+            clearTimeout(this._sseFlushTimer);
+            this._sseFlushTimer = null;
           }
+          this._ssePending = {};
           if (this._eventSource) {
             try { this._eventSource.close(); } catch (e) {}
             this._eventSource = null;
@@ -3161,7 +3184,7 @@
         async fetchConnectionStatus() {
           try {
             const response = await axios.get('/api/connection/status');
-            this.connectionInfo = response.data;
+            this.setConnectionInfo(response.data);
             if (typeof response.data.stay_at_4800 === 'boolean') {
               this.stayAt4800Baud = response.data.stay_at_4800;
             }
@@ -3251,12 +3274,22 @@
           this.connectionInfo.message = 'Connection cancelled';
         },
         // ── ArduRover parameter setup ──────────────────────────────
+        // Status polls and SSE deliver the same snapshot every second; only
+        // replace it when something changed, since each replacement
+        // re-renders the whole page.
+        setConnectionInfo(info) {
+          if (JSON.stringify(info) !== JSON.stringify(this.connectionInfo)) {
+            this.connectionInfo = info;
+          }
+        },
         mergeAutopilotSetup(data) {
           if (!data || typeof data !== 'object') return;
           const merged = Object.assign({}, this.autopilotSetup, data);
           merged.expected = data.expected || {};
           if (!Array.isArray(merged.drift)) merged.drift = merged.drift || [];
-          this.autopilotSetup = merged;
+          if (JSON.stringify(merged) !== JSON.stringify(this.autopilotSetup)) {
+            this.autopilotSetup = merged;
+          }
           // Seed the form once with the persisted selection so the user
           // sees what was applied before; later merges must not overwrite
           // an in-progress edit (including an explicit "Not used").
@@ -3780,7 +3813,8 @@
         // track them (they change ~50 times a second).
         this.messages = [];
         this._nmeaBuffer = [];
-        this._nmeaFlushTimer = null;
+        this._ssePending = {};
+        this._sseFlushTimer = null;
       },
       mounted() {
         // Load unit preference from localStorage
