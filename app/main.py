@@ -250,6 +250,9 @@ class NMEAHandler:
         self.connection_step_since = None  # epoch when current status phase began
         self.detected_baud = None
         self._cancel_connect = False  # flag checked by connect loops
+        # Serialises connect attempts: the startup auto-connect thread and a
+        # UI-initiated connect must never probe serial ports concurrently.
+        self._connect_lock = threading.Lock()
 
         # Device identification (populated from $PAMTC,QPS / $PAMTC,QV after connect).
         # model_code is up to 10 ASCII chars per the WX manual; examples include
@@ -261,6 +264,11 @@ class NMEAHandler:
         
         self.state = {
             'port': None,
+            # /dev/serial/by-id name of the saved port. ttyUSBn numbering can
+            # swap across reboots, so auto-connect resolves this first and
+            # never falls back to a bare ttyUSBn that may now be another
+            # device (e.g. the vehicle's GPS).
+            'port_id': None,
             'baud_rate': 4800,
             'stay_at_4800': False,  # persisted; used by startup auto-connect
             'is_streaming': False,
@@ -591,16 +599,60 @@ class NMEAHandler:
         self.connection_message = message
         self.connection_step_since = time.time()
 
-    def _auto_connect(self):
-        """Background auto-connect: try saved port + baud hint first, then scan others.
-        No UI click required; uses state.json from last successful session."""
-        self._cancel_connect = False
-        saved_port = self.state.get('port')
-        saved_baud = self.state.get('baud_rate', 4800)
-        stay_4800 = bool(self.state.get('stay_at_4800', False))
+    def _by_id_name_for_device(self, device):
+        """Return the /dev/serial/by-id link name pointing at `device`, or None."""
+        try:
+            target = str(Path(device).resolve())
+            by_id = Path('/dev/serial/by-id')
+            if by_id.is_dir():
+                for link in by_id.iterdir():
+                    if link.is_symlink() and str(link.resolve()) == target:
+                        return link.name
+        except Exception as e:
+            self.app_logger.debug(f"by-id lookup failed for {device}: {e}")
+        return None
 
-        # Try the saved port first (most likely to succeed)
+    def _resolve_saved_port(self):
+        """Device path for the port saved in state.json, or None.
+
+        Prefers the stable by-id name. If a by-id name was saved but that
+        device is not present, returns None rather than the old ttyUSBn path:
+        after a re-enumeration that path may belong to a different device.
+        """
+        port_id = self.state.get('port_id')
+        if port_id:
+            link = Path('/dev/serial/by-id') / port_id
+            if link.exists():
+                return str(link.resolve())
+            return None
+        saved_port = self.state.get('port')
         if saved_port and Path(saved_port).exists():
+            return saved_port
+        return None
+
+    def _auto_connect(self):
+        """Background auto-connect to the port saved from the last successful session.
+
+        Only the saved port is tried. Other ports are never scanned: probing
+        writes Airmar commands and changes the line's baud rate, which can
+        disrupt other devices on the vehicle (e.g. a GPS on another ttyUSB).
+        With no saved port the extension waits for the user to pick one."""
+        with self._connect_lock:
+            self._cancel_connect = False
+            saved_port = self._resolve_saved_port()
+            saved_baud = self.state.get('baud_rate', 4800)
+            stay_4800 = bool(self.state.get('stay_at_4800', False))
+
+            if not saved_port:
+                if self.state.get('port_id') or self.state.get('port'):
+                    msg = (f"Saved port {self.state.get('port_id') or self.state.get('port')} "
+                           "not found — select the Airmar's port and click Connect")
+                else:
+                    msg = "Select the Airmar's serial port and click Connect"
+                self._set_conn_status(self.CONN_STATUS_DISCONNECTED, msg)
+                self.app_logger.info(f"Auto-connect: {msg}")
+                return
+
             self._set_conn_status(self.CONN_STATUS_AUTO_SCANNING,
                                   f'Trying saved port {saved_port}...')
             self.app_logger.info(
@@ -613,41 +665,31 @@ class NMEAHandler:
                     max_attempts=6)
                 if success:
                     self.app_logger.info(f"Auto-connect: restored {saved_port}")
-                    return
+                else:
+                    self.app_logger.error(f"Auto-connect: saved port failed: {msg}")
             except Exception as e:
+                self._set_conn_status(self.CONN_STATUS_FAILED, str(e))
                 self.app_logger.error(f"Auto-connect: saved port failed: {e}")
 
-        # Saved port failed or missing — try every other available port once
-        all_ports = self.get_ports()
-        other_ports = [p for p in all_ports if p != saved_port]
-        if not other_ports:
-            if not saved_port or not Path(saved_port).exists():
-                self._set_conn_status(self.CONN_STATUS_FAILED,
-                                      'No serial ports found')
-                self.app_logger.error("Auto-connect: no serial ports found")
-            return
+    def user_connect(self, port, stay_at_4800=False, lock_timeout=30.0):
+        """Connect requested from the UI.
 
-        self.app_logger.info(f"Auto-connect: scanning {len(other_ports)} other port(s)")
-        for i, port in enumerate(other_ports, 1):
-            if self._cancel_connect:
-                self._set_conn_status(self.CONN_STATUS_DISCONNECTED, 'Cancelled')
-                return
-            self._set_conn_status(self.CONN_STATUS_AUTO_SCANNING,
-                                  f'Scanning port {port} ({i}/{len(other_ports)})...')
-            try:
-                success, msg = self.connect_serial(
-                    port, 4800,
-                    stay_at_4800=stay_4800,
-                    max_attempts=6)
-                if success:
-                    self.app_logger.info(f"Auto-connect: connected on {port}")
-                    return
-            except Exception as e:
-                self.app_logger.debug(f"Auto-connect: {port} failed: {e}")
-
-        self._set_conn_status(self.CONN_STATUS_FAILED,
-                              'No device responded on any port')
-        self.app_logger.error("Auto-connect: no device responded on any port")
+        Cancels any in-flight auto-connect, waits for it to release the
+        serial port, then clears the cancel flag so this attempt is not
+        aborted by a cancel left over from an earlier attempt."""
+        self._cancel_connect = True
+        if not self._connect_lock.acquire(timeout=lock_timeout):
+            return False, 'Another connection attempt is still running; try again'
+        try:
+            self._cancel_connect = False
+            # Use saved baud as a hint (e.g. 115200 if the device was already switched)
+            if port == self._resolve_saved_port():
+                baud_rate = self.state.get('baud_rate', 4800)
+            else:
+                baud_rate = 4800
+            return self.connect_serial(port, baud_rate, stay_at_4800=stay_at_4800)
+        finally:
+            self._connect_lock.release()
 
     def start_reader_thread(self):
         """Start the background thread for reading serial data"""
@@ -1948,6 +1990,8 @@ class NMEAHandler:
             start_time = time.time()
             valid_count = 0
             while time.time() - start_time < timeout:
+                if self._cancel_connect:
+                    break
                 try:
                     data = conn.readline().decode('utf-8', errors='ignore').strip()
                     if self._incoming_line_checksum_valid(data):
@@ -2520,6 +2564,7 @@ class NMEAHandler:
                     self.serial_connection = conn
                     self.detected_baud = current_baud
                     self.state['port'] = port
+                    self.state['port_id'] = self._by_id_name_for_device(port)
                     
                     if current_baud == 4800 and not stay_at_4800:
                         # Connected at 4800, switch to operating baud unless user requested 4800 only
@@ -2621,6 +2666,7 @@ class NMEAHandler:
             
             # Reset state
             self.state['port'] = None
+            self.state['port_id'] = None
             self.message_history = []  # Clear message history
             self.nmea_messages = set()  # Clear detected message types
             self.sentence_last_seen = {}
@@ -2853,13 +2899,8 @@ def select_port():
     if not data or 'port' not in data:
         return jsonify({"success": False, "message": "No port specified"})
     
-    # Use saved baud as a hint for which rate to try first (e.g. 115200 if already switched)
-    if data['port'] == nmea_handler.state.get('port'):
-        baud_rate = nmea_handler.state.get('baud_rate', 4800)
-    else:
-        baud_rate = 4800
     stay_at_4800 = bool(data.get('stay_at_4800', False))
-    success, message = nmea_handler.connect_serial(data['port'], baud_rate, stay_at_4800=stay_at_4800)
+    success, message = nmea_handler.user_connect(data['port'], stay_at_4800=stay_at_4800)
     return jsonify({"success": success, "message": message})
 
 @app.route('/api/serial/cancel', methods=['POST'])

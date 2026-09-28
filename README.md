@@ -5,7 +5,7 @@ A BlueOS extension for the Airmar 300WX WeatherStation. Connects via NMEA 0183 s
 ## Features
 
 - Automatic serial port detection and baud rate negotiation (4800 → 115200, default saved on device)
-- **Auto-reconnect on extension restart**: last serial port, baud hint, and “stay at 4800” preference are stored in `state.json` under the mounted logs directory; a background thread connects at startup without using the UI. **Disconnect** in the UI clears the saved port so the next restart will scan ports instead.
+- **Auto-reconnect on extension restart**: the last serial port (by its stable `/dev/serial/by-id` name), baud hint, and “stay at 4800” preference are stored in `state.json` under the mounted logs directory; a background thread reconnects to that port at startup without using the UI. Other ports are never scanned automatically, so a GPS or other device on another USB port is left alone. On first install, after **Disconnect**, or if the saved device is unplugged, pick the port in the UI and click **Connect**.
 - Real-time dashboard with wind, heading, atmosphere, GPS, and attitude data (including apparent/true wind roses and speed–time heatmaps)
 - Sparkline history graphs for all sensor channels
 - Per-sentence enable/disable and transmission interval control
@@ -213,8 +213,8 @@ These logs persist across container restarts and can be managed from the Logs ta
 ## Usage
 
 1. Open the Airmar 300WX extension from the BlueOS sidebar
-2. The extension auto-connects to the last used serial port on startup
-3. Select a serial port from the dropdown or device identification list
+2. The extension auto-connects to the last used serial port on startup (it does not scan other ports)
+3. On first use, select a serial port from the dropdown or device identification list
 4. Click "Connect" — the extension negotiates 115200 baud automatically and stores that as the sensor default
 5. View live sensor data on the Dashboard tab
 6. Configure sentence enable/disable on the Sentences tab
@@ -229,14 +229,6 @@ git clone https://github.com/vshie/Airmar-WX.git
 cd Airmar-WX
 docker build -t vshie/blueos-airmar-wx:latest .
 ```
-
-### Local Testing
-
-```bash
-docker-compose up --build
-```
-
-Then visit `http://localhost:6436` in your browser.
 
 ### GitHub Actions
 
