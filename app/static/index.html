@@ -3602,6 +3602,7 @@
         },
         startPolling() {
           if (this.pollingInterval) return;  // several callers; never stack timers
+          if (document.hidden) return;  // resumeLiveUpdates restarts it
           let tick = 0;
           this.pollingInterval = setInterval(() => {
             tick++;
@@ -3625,6 +3626,38 @@
             clearInterval(this.pollingInterval);
             this.pollingInterval = null;
           }
+        },
+        // Nothing on this page needs to run while nobody can see it: the UDP
+        // feeds and MAVLink values all come from the backend. A hidden tab
+        // kept parsing ~55 SSE events/s and re-rendering, and Chrome barely
+        // collects garbage in background tabs, so its heap grew to GBs.
+        // Drop the live feed while hidden; the SSE `init` event reseeds
+        // everything on resume.
+        pauseLiveUpdates() {
+          this.stopSse();
+          this.stopPolling();
+          if (this.freshnessInterval) {
+            clearInterval(this.freshnessInterval);
+            this.freshnessInterval = null;
+          }
+        },
+        resumeLiveUpdates() {
+          this.startLiveFeed();
+          this.fetchConnectionStatus();  // restarts polling when connected
+          if (this.activeTab === 1) this.fetchSensorHistory();
+        },
+        startLiveFeed() {
+          this.startSse();
+          this.freshnessTick = Date.now();
+          if (!this.freshnessInterval) {
+            this.freshnessInterval = setInterval(() => {
+              this.freshnessTick = Date.now();
+            }, 1000);
+          }
+        },
+        onVisibilityChange() {
+          if (document.hidden) this.pauseLiveUpdates();
+          else this.resumeLiveUpdates();
         },
         // Sentence configuration methods
         async fetchSentences() {
@@ -3848,21 +3881,20 @@
         this.fetchSensorHistory();
         this.fetchLogsInfo();
         this.fetchAutopilotSetup();
-        this.startSse();
-        this.freshnessTick = Date.now();
-        this.freshnessInterval = setInterval(() => {
-          this.freshnessTick = Date.now();
-        }, 1000);
+        if (!document.hidden) this.startLiveFeed();
+        this._onVisibilityChange = () => this.onVisibilityChange();
+        document.addEventListener('visibilitychange', this._onVisibilityChange);
         // Poll the autopilot for parameter drift every 30s. Cheap and covers
         // manual param changes made outside this extension (Mission Planner,
         // Cockpit param editor, etc).
         this._autopilotCheckTimer = setInterval(() => {
-          if (this.autopilotSetup.applied && !this.autopilotBusy) {
+          if (!document.hidden && this.autopilotSetup.applied && !this.autopilotBusy) {
             this.checkAutopilotSetup();
           }
         }, 30000);
       },
       beforeDestroy() {
+        document.removeEventListener('visibilitychange', this._onVisibilityChange);
         this.stopSse();
         if (this.sentenceFlushTimer) {
           clearTimeout(this.sentenceFlushTimer);
