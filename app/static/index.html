@@ -3677,6 +3677,9 @@
           try {
             const r = await axios.get('/api/autopilot/check');
             if (r.data && r.data.status) this.mergeAutopilotSetup(r.data.status);
+            // The server stands the check aside while a setup runs; keep the
+            // last drift result rather than showing anything.
+            if (r.data && r.data.skipped) return;
             if (r.data) {
               const drift = Array.isArray(r.data.drift) ? r.data.drift : [];
               // transport_ok=false means we couldn't read anything back
@@ -4233,10 +4236,8 @@
         // manual param changes made outside this extension (Mission Planner,
         // Cockpit param editor, etc).
         this._autopilotCheckTimer = setInterval(() => {
-          // Not while a setup preview is open or running: the check holds the
-          // server's setup lock, which would make the Confirm wait for it.
           if (!document.hidden && this.autopilotSetup.applied && !this.autopilotBusy &&
-              !this.setupJobRunning && !this.setupPreview) {
+              !this.setupJobRunning) {
             this.checkAutopilotSetup();
           }
         }, 30000);

@@ -377,6 +377,9 @@ class NMEAHandler:
         # Pause between the last PARAM_SET and the restart so ArduPilot's
         # storage thread has flushed the writes before the process is killed.
         self._setup_settle_s = 3.0
+        # Bumped every time the setup lock is taken, so a drift check that
+        # overlapped any setup/apply/undo can tell and discard its reading.
+        self._setup_generation = 0
         
         # Aggregated sensor data for dashboard display
         self.sensor_data = {
@@ -1672,12 +1675,18 @@ class NMEAHandler:
                 'ignore_drift': bool(setup.get('ignore_drift', False)),
                 'status': self.get_autopilot_setup_status(),
             }
-        if not self._acquire_setup_lock():
-            return False, self._SETUP_BUSY, {}
-        try:
-            current = self._param_client.read_expected(expected)
-        finally:
-            self._autopilot_setup_lock.release()
+        # Read-only, so it never takes the setup lock: Set up / Undo must not
+        # wait on (or be refused because of) the UI's 30 s background check.
+        # Instead the check stands aside: it skips while any setup operation
+        # holds the lock, and throws its reading away if one started or
+        # finished meanwhile (values could be half-written).
+        skipped = {'skipped': True, 'status': self.get_autopilot_setup_status()}
+        if self._autopilot_setup_lock.locked():
+            return True, 'check skipped: autopilot setup in progress', skipped
+        generation = self._setup_generation
+        current = self._param_client.read_expected(expected)
+        if self._autopilot_setup_lock.locked() or self._setup_generation != generation:
+            return True, 'check skipped: autopilot setup ran meanwhile', skipped
         # Transport-failure short-circuit: if not one param echoed back,
         # we can't tell whether they drifted or the transport is broken.
         # Report the ambiguity honestly instead of manufacturing drift.
@@ -1782,7 +1791,10 @@ class NMEAHandler:
         job = self._setup_job
         if job and job.get('running'):
             return False
-        return self._autopilot_setup_lock.acquire(timeout=self.SETUP_LOCK_WAIT_S)
+        if not self._autopilot_setup_lock.acquire(timeout=self.SETUP_LOCK_WAIT_S):
+            return False
+        self._setup_generation += 1
+        return True
 
     def _serial_support_public(self):
         s = self._serial_support

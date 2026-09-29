@@ -309,15 +309,14 @@ class SetupFlowTests(FlowTestBase):
             ok, msg, _ = self.h.start_setup_job('undo', 'x', run_async=False)
             self.assertFalse(ok)
             self.assertIn('in progress', msg)
-            ok, msg, _ = self.h.check_autopilot_setup()
-            self.assertFalse(ok)
+            ok, msg, payload = self.h.check_autopilot_setup()
+            self.assertTrue(payload.get('skipped'))
             self.assertLess(time.monotonic() - t0, 1, 'must not wait out a job')
         finally:
             self.h._autopilot_setup_lock.release()
 
-    def test_confirm_waits_for_a_running_check(self):
-        # Regression (1.1.1 on the vehicle): the UI's 30 s background Check
-        # held the lock and a Confirm clicked meanwhile was refused.
+    def test_confirm_waits_for_another_short_operation(self):
+        # e.g. a Preview from a second browser tab.
         p = self.preview()
         self.h._autopilot_setup_lock.acquire()
         threading.Timer(0.2, self.h._autopilot_setup_lock.release).start()
@@ -342,6 +341,67 @@ class SetupFlowTests(FlowTestBase):
         self.assertIn('serial_auto', status)
         self.assertIn('job', status)
         self.assertFalse(status['undo_available'])
+
+
+class CheckDeconflictTests(FlowTestBase):
+    """The UI's 30 s drift check must never block or fail Set up / Undo."""
+
+    def applied(self):
+        self.confirm(self.preview())
+        self.assertTrue(self.saved()['applied'])
+
+    def test_check_does_not_take_the_setup_lock(self):
+        # Regression (1.1.1 on the vehicle): the background Check held the
+        # setup lock and a Confirm clicked meanwhile was refused.
+        self.applied()
+        seen = {}
+        real = self.ap.read_expected
+
+        def spy(expected):
+            seen['locked'] = self.h._autopilot_setup_lock.locked()
+            # A Confirm arriving mid-check gets the lock straight away.
+            seen['acquired'] = self.h._autopilot_setup_lock.acquire(blocking=False)
+            if seen['acquired']:
+                self.h._autopilot_setup_lock.release()
+            return real(expected)
+        self.ap.read_expected = spy
+        ok, msg, payload = self.h.check_autopilot_setup()
+        self.assertFalse(seen['locked'])
+        self.assertTrue(seen['acquired'])
+
+    def test_check_skips_while_setup_holds_the_lock(self):
+        self.applied()
+        self.h._autopilot_setup_lock.acquire()
+        try:
+            reads = []
+            self.ap.read_expected = lambda e: reads.append(e) or {}
+            ok, msg, payload = self.h.check_autopilot_setup()
+        finally:
+            self.h._autopilot_setup_lock.release()
+        self.assertTrue(ok)
+        self.assertTrue(payload['skipped'])
+        self.assertEqual(reads, [], 'must not read while a setup is writing')
+
+    def test_check_discards_reading_when_setup_ran_meanwhile(self):
+        self.applied()
+        real = self.ap.read_expected
+
+        def setup_during_read(expected):
+            out = real(expected)
+            self.ap.read_expected = real
+            self.confirm(self.preview())  # a whole Set up slips in
+            return out
+        self.ap.read_expected = setup_during_read
+        ok, msg, payload = self.h.check_autopilot_setup()
+        self.assertTrue(payload.get('skipped'), msg)
+        self.assertNotIn('drift', payload)
+
+    def test_check_reports_drift_normally(self):
+        self.applied()
+        self.ap.params['GPS2_TYPE'] = 0.0
+        ok, msg, payload = self.h.check_autopilot_setup()
+        self.assertFalse(payload.get('skipped'))
+        self.assertEqual([d['param'] for d in payload['drift']], ['GPS2_TYPE'])
 
 
 class UndoFlowTests(FlowTestBase):
