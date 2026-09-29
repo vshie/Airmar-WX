@@ -288,7 +288,9 @@ class NMEAHandler:
             # checkbox; never switched on implicitly by connecting.
             'stream_wind': False,   # $WIMWV → UDP 27001
             'stream_gps': False,    # $GPGGA/RMC/VTG, $HCHDT → UDP 27002
+            # User-chosen rates only; the GPS route's 10 Hz is never saved here.
             'sentence_config': {},  # { sentence_id: { "enabled": bool, "interval": int (tenths) } }
+            'gps_route_rate_unsaved': True,  # see _migrate_gps_route_rate_out_of_sentence_config
             # Persisted ArduRover autopilot setup (see mavlink_params.py).
             # Populated after the user picks SERIAL X/Y and applies once.
             # Shape: {
@@ -551,6 +553,7 @@ class NMEAHandler:
                     self.app_logger.info(
                         "Migrating UDP streaming to per-route opt-in: "
                         f"wind={self.state['stream_wind']}, gps={self.state['stream_gps']}")
+                self._migrate_gps_route_rate_out_of_sentence_config(loaded)
                 self.is_streaming = bool(self.state['stream_wind'] or self.state['stream_gps'])
                 self.app_logger.debug(f"Loaded state: port={self.state['port']}, baud={self.state['baud_rate']}, streaming={self.is_streaming}")
         except Exception as e:
@@ -567,6 +570,30 @@ class NMEAHandler:
             self.app_logger.debug(f"Saved state: port={self.state['port']}, baud={self.state['baud_rate']}")
         except Exception as e:
             self.app_logger.error(f"Error saving state: {e}")
+
+    def _migrate_gps_route_rate_out_of_sentence_config(self, loaded):
+        """Undo 1.1.11-1.1.14 saving the GPS route's 10 Hz as a user setting.
+
+        Those versions wrote the route's rate through the saving path, so
+        ticking GPS left `{'enabled': True, 'interval': 1}` in
+        `sentence_config` for GGA/RMC/VTG/HDT and unticking could never get
+        back to the user's rate. Exactly that entry is what the route wrote,
+        so drop it (the user then gets the 1 Hz default, or 10 Hz again while
+        the route is on). Runs once, marked by `gps_route_rate_unsaved`.
+        """
+        if loaded.get('gps_route_rate_unsaved'):
+            return
+        saved = self.state.get('sentence_config') or {}
+        dropped = [sid for sid in self.HIGH_BAUD_GPS_HZ_OVERRIDE_TENTHS
+                   if saved.get(sid) == {'enabled': True, 'interval': 1}]
+        for sid in dropped:
+            del saved[sid]
+        self.state['gps_route_rate_unsaved'] = True
+        if dropped:
+            self.app_logger.info(
+                "Migrating GPS route rate out of saved sentence config: dropped %s",
+                ", ".join(sorted(dropped)))
+        self.save_state()
 
     def _migrate_autopilot_setup_gps_contract(self):
         """Upgrade pre-1.1.6 autopilot_setup snapshots to the two-GPS contract.
@@ -2144,23 +2171,34 @@ class NMEAHandler:
     def _apply_gps_sentence_rate(self):
         """Write the GPS-family sentence rate that matches `stream_gps`.
 
-        Goes through `configure_sentences_batch` so `sentence_config` (and
-        therefore the Sentences tab and the next reconnect) agree with what
-        the device is doing. No-op when not connected.
+        With the GPS route on (at 115200) the sentences are forced to the
+        10 Hz ArduPilot needs. With it off they go back to what the user
+        saved on the Sentences tab, or the 1 Hz default if they never did.
+        The route's 10 Hz is a temporary requirement, not a user choice, so
+        it is written with `save=False`: `sentence_config` keeps holding the
+        user's own settings for the restore. No-op when not connected.
         """
         if not self.serial_connection or not self.serial_connection.is_open:
             return True, "Not connected; rate applies on next connect"
         baud = self.serial_connection.baudrate
-        changes = [
-            {'sentence_id': sid, 'enabled': True,
-             'interval': self._required_interval_for(sid, baud)}
-            for sid in sorted(self.HIGH_BAUD_GPS_HZ_OVERRIDE_TENTHS)
-        ]
-        ok, msg = self.configure_sentences_batch(changes)
-        hz = 10.0 / max(changes[0]['interval'], 1)
+        saved = self.state.get('sentence_config') or {}
+        changes = []
+        for sid in sorted(self.HIGH_BAUD_GPS_HZ_OVERRIDE_TENTHS):
+            required = self._required_interval_for(sid, baud)
+            default = int(self.SUPPORTED_SENTENCES[sid].get('default_interval', 10))
+            if required != default:
+                changes.append({'sentence_id': sid, 'enabled': True, 'interval': required})
+            elif sid in saved:
+                changes.append({'sentence_id': sid,
+                                'enabled': bool(saved[sid].get('enabled', True)),
+                                'interval': saved[sid].get('interval')})
+            else:
+                changes.append({'sentence_id': sid, 'enabled': True, 'interval': default})
+        ok, msg = self.configure_sentences_batch(changes, save=False)
         self.app_logger.info(
-            "GPS sentences %s set to %.0f Hz (stream_gps=%s, %d baud): %s",
-            ",".join(c['sentence_id'] for c in changes), hz,
+            "GPS sentences set to %s (stream_gps=%s, %d baud): %s",
+            ", ".join(f"{c['sentence_id']}={'on' if c['enabled'] else 'off'}@{c['interval']}"
+                      for c in changes),
             bool(self.state.get('stream_gps')), baud, msg,
         )
         return ok, msg
@@ -2262,9 +2300,10 @@ class NMEAHandler:
             self.app_logger.error(f"Error configuring sentence {sentence_id}: {e}")
             return False, str(e)
 
-    def configure_sentences_batch(self, changes):
+    def configure_sentences_batch(self, changes, save=True):
         """Configure multiple sentences in one locked session.
-        changes: list of dicts: {sentence_id, enabled, interval} where interval is tenths-of-seconds or None."""
+        changes: list of dicts: {sentence_id, enabled, interval} where interval is tenths-of-seconds or None.
+        save=False writes the device only, leaving the user's saved `sentence_config` untouched."""
         try:
             if not self.serial_connection or not self.serial_connection.is_open:
                 return False, "Not connected"
@@ -2287,14 +2326,15 @@ class NMEAHandler:
                     try:
                         self.serial_connection.write(cmd)
                         self.device_sentence_config[sentence_id] = {'enabled': enabled, 'interval': interval}
-                        if 'sentence_config' not in self.state:
-                            self.state['sentence_config'] = {}
-                        self.state['sentence_config'][sentence_id] = {'enabled': enabled, 'interval': interval}
+                        if save:
+                            if 'sentence_config' not in self.state:
+                                self.state['sentence_config'] = {}
+                            self.state['sentence_config'][sentence_id] = {'enabled': enabled, 'interval': interval}
                         applied += 1
                         time.sleep(0.15)
                     except Exception as e:
                         errors.append(f"{sentence_id}: {e}")
-            if applied > 0:
+            if applied > 0 and save:
                 self.save_state()
             if errors:
                 self.app_logger.warning(f"Batch configure had errors: {errors}")

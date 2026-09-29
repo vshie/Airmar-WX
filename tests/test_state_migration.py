@@ -272,6 +272,44 @@ class StreamRouteMigrationTests(unittest.TestCase):
         self.assertTrue(h.is_streaming)
 
 
+class GpsRouteRateMigrationTests(StreamRouteMigrationTests):
+    """1.1.15: the GPS route's 10 Hz must not live in the user's saved
+    sentence_config (1.1.11-1.1.14 saved it there when GPS was ticked)."""
+
+    ROUTE_WRITE = {'enabled': True, 'interval': 1}
+
+    def test_route_written_10hz_is_dropped_once(self):
+        h = self._load_with({
+            'stream_gps': True, 'stream_wind': False,
+            'sentence_config': {
+                'GGA': self.ROUTE_WRITE, 'RMC': self.ROUTE_WRITE,
+                'VTG': self.ROUTE_WRITE, 'HDT': self.ROUTE_WRITE,
+                'MWD': {'enabled': True, 'interval': 1},    # not a GPS sentence
+            },
+        })
+        self.assertEqual(h.state['sentence_config'],
+                         {'MWD': {'enabled': True, 'interval': 1}})
+        self.assertTrue(h.state['gps_route_rate_unsaved'])
+        self.assertTrue(h.state['stream_gps'])
+
+    def test_other_user_rates_survive(self):
+        h = self._load_with({
+            'sentence_config': {'GGA': {'enabled': True, 'interval': 5},
+                                'VTG': {'enabled': False, 'interval': 1}},
+        })
+        self.assertEqual(h.state['sentence_config'],
+                         {'GGA': {'enabled': True, 'interval': 5},
+                          'VTG': {'enabled': False, 'interval': 1}})
+
+    def test_already_migrated_state_is_left_alone(self):
+        # After the migration, a 10 Hz GGA can only be the user's own choice.
+        h = self._load_with({
+            'gps_route_rate_unsaved': True,
+            'sentence_config': {'GGA': self.ROUTE_WRITE},
+        })
+        self.assertEqual(h.state['sentence_config'], {'GGA': self.ROUTE_WRITE})
+
+
 class PartialApplyTests(unittest.TestCase):
     """Step 2b: wind-only / GPS-only applies write and persist one route."""
 

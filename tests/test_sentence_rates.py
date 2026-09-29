@@ -99,7 +99,10 @@ class RequiredSentenceTests(unittest.TestCase):
                 sorted(w.split('*')[0] for w in writes),
                 [f'$PAMTC,EN,{sid},1,1' for sid in ('GGA', 'HDT', 'RMC', 'VTG')],
             )
-            self.assertEqual(self.handler.state['sentence_config']['GGA']['interval'], 1)
+            # The route's 10 Hz is a requirement, not a user choice: the
+            # device runs it but the saved config must not record it.
+            self.assertEqual(self.handler.device_sentence_config['GGA']['interval'], 1)
+            self.assertNotIn('GGA', self.handler.state.get('sentence_config') or {})
             writes.clear()
             self.handler.set_stream_routes(gps=False)
             self.assertEqual(
@@ -110,6 +113,44 @@ class RequiredSentenceTests(unittest.TestCase):
             writes.clear()
             self.handler.set_stream_routes(wind=True)
             self.assertEqual(writes, [])
+        self.handler.serial_connection = None
+
+    def test_unticking_gps_restores_user_configured_rates(self):
+        """Unticking the GPS route puts back the rates the user saved on the
+        Sentences tab before ticking it; unsaved sentences get 1 Hz."""
+        writes = []
+
+        class _FakeSerial:
+            is_open = True
+            baudrate = 115200
+            port = '/dev/ttyUSB1'
+
+            def write(self, data):
+                writes.append(data.decode())
+
+        self.handler.serial_connection = _FakeSerial()
+        self.handler.state['stream_gps'] = False
+        user = {'GGA': {'enabled': True, 'interval': 5},    # 2 Hz
+                'VTG': {'enabled': False, 'interval': 10}}  # switched off
+        self.handler.state['sentence_config'] = {k: dict(v) for k, v in user.items()}
+        with mock.patch.object(self.handler, '_create_udp_socket', return_value=mock.Mock()), \
+                mock.patch('time.sleep'):
+            self.handler.set_stream_routes(gps=True)
+            self.assertEqual(
+                sorted(w.split('*')[0] for w in writes),
+                [f'$PAMTC,EN,{sid},1,1' for sid in ('GGA', 'HDT', 'RMC', 'VTG')],
+            )
+            self.assertEqual(self.handler.state['sentence_config'], user)
+            writes.clear()
+            self.handler.set_stream_routes(gps=False)
+        self.assertEqual(
+            sorted(w.split('*')[0] for w in writes),
+            ['$PAMTC,EN,GGA,1,5', '$PAMTC,EN,HDT,1,10',
+             '$PAMTC,EN,RMC,1,10', '$PAMTC,EN,VTG,0,10'],
+        )
+        self.assertEqual(self.handler.state['sentence_config'], user)
+        self.assertEqual(self.handler.device_sentence_config['GGA'],
+                         {'enabled': True, 'interval': 5})
         self.handler.serial_connection = None
 
     def test_device_config_reports_rates_set_at_connect(self):
