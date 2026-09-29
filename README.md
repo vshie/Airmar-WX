@@ -88,6 +88,16 @@ Each route has its own checkbox under **Send to ArduPilot over UDP** in the conn
 | Wind    | `27001` | `$WIMWV`                                | `AP_WindVane_NMEA` (`WNDVN_TYPE = 4`) |
 | GPS + heading | `27002` | `$GPGGA`, `$GPRMC`, `$GPVTG`, `$HCHDT` | `AP_GPS` NMEA driver on **GPS2** (`GPS2_TYPE = 5`); onboard GPS stays on `GPS1_TYPE = 1` (AUTO) |
 
+### One-click setup (Navigator boards)
+
+On Linux autopilot boards (Navigator, Navigator64, Argonot) the extension can do the whole setup itself. In **Setup → Step 2**, pick the SERIAL port for each stream and click **Set up**:
+
+1. **Preview.** A dialog lists every change before anything is written: each BlueOS serial port (now → after) and each ArduRover parameter (now → after). Entries that replace something already on the target port, or that move our UDP port off another serial, are highlighted.
+2. **Confirm.** The extension saves the BlueOS serial list (through BlueOS's `ardupilot-manager` API, the same one the Autopilot Firmware page uses), writes the parameters, restarts ArduPilot once so both take effect, waits for it to come back, and verifies. Progress and a results table are shown on the card. It refuses to start, or to restart ArduPilot, while the vehicle is armed.
+3. **Undo serial and parameter setup** appears once setup has changed something. It shows the same kind of preview and puts back the serial ports and parameters exactly as they were before the first setup, then restarts ArduPilot. A serial port you changed yourself since setup is left alone, and a parameter whose original value couldn't be read is left as it is (both are listed).
+
+Only SERIAL1–7 can be set this way (BlueOS's own limit). BlueOS won't save a serial list containing a `/dev` device that is no longer connected, so the preview lists any such entries and asks before removing them. On other boards (Pixhawk over USB, SITL) the button isn't shown and the manual steps below apply.
+
 ### BlueOS serial port configuration (manual)
 
 Open **BlueOS → Autopilot Firmware → Serial port configuration** and set the `udpin` device string for each stream you want, then Save and Restart the autopilot:
@@ -127,8 +137,8 @@ Notes:
 - **Apply-once model.** Parameters are only written when you click Apply. A background check compares live values against the applied snapshot every 30 s; if any drift is detected, the UI offers **Restore** (re-apply) or **Ignore** (persist a per-selection "never nag again" flag). Changing the SERIAL indexes or the yaw fallback checkbox counts as a new setup and clears the ignore flag.
 - **UDPIN ignores `SERIALx_BAUD`.** The extension does not write baud so a wired UART on the same index is not silently reconfigured.
 - **Missing firmware params are skipped**, not treated as failures — the setup still succeeds on a build without wind-vane support, and the UI reports which rows were unavailable.
-- **The extension does not write the BlueOS serial device string.** That mapping lives in BlueOS, not in ArduPilot parameters — you still paste the two `udpin` strings manually and reboot the autopilot after Save.
-- **Restart the autopilot** after applying parameters that change `SERIALx_PROTOCOL`, `GPS1_TYPE`, `GPS2_TYPE`, or `WNDVN_TYPE` — those are read at boot.
+- **Parameters only** (or **Apply parameters** on boards without one-click setup) does not write the BlueOS serial device string: paste the two `udpin` strings manually and reboot the autopilot after Save.
+- **Restart the autopilot** after applying parameters with **Parameters only** that change `SERIALx_PROTOCOL`, `GPS1_TYPE`, `GPS2_TYPE`, or `WNDVN_TYPE` — those are read at boot.
 
 See [ArduRover Wind Vane docs](https://ardupilot.org/rover/docs/wind-vane.html), [ArduPilot NMEA GPS](https://ardupilot.org/copter/docs/common-gps-how-it-works.html), and [EKF Source Selection](https://ardupilot.org/copter/docs/common-ekf-sources.html) for autopilot-side background.
 

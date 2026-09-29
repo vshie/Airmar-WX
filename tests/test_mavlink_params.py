@@ -629,5 +629,56 @@ class ParamValueDecodingTests(unittest.TestCase):
         self.assertIsNone(value)
 
 
+class HeartbeatTests(unittest.TestCase):
+    """Armed check and post-restart wait, judged by HEARTBEAT freshness."""
+
+    HB_SUFFIX = '/mavlink/vehicles/1/components/1/messages/HEARTBEAT'
+
+    def _client(self, heartbeats):
+        """`heartbeats`: list of (base_mode_bits, last_update) served in order
+        (the last one repeats); an entry of None serves "None"."""
+        import json as _json
+        state = {'i': 0}
+
+        def serve(url):
+            i = min(state['i'], len(heartbeats) - 1)
+            state['i'] += 1
+            hb = heartbeats[i]
+            if hb is None:
+                return _FakeResponse(200, 'None')
+            bits, stamp = hb
+            return _FakeResponse(200, _json.dumps({
+                'message': {'type': 'HEARTBEAT', 'base_mode': {'bits': bits}},
+                'status': {'time': {'last_update': stamp}},
+            }))
+        client = mp.ParamClient(base_url='http://fake/mavlink2rest',
+                                target_system=1, target_component=1)
+        client._session = _FakeSession(get_responses={self.HB_SUFFIX: serve})
+        return client
+
+    def setUp(self):
+        from unittest import mock
+        patcher = mock.patch('time.sleep')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_is_armed_reads_base_mode_bit_128(self):
+        self.assertTrue(self._client([(209, 't1'), (209, 't2')]).is_armed())
+        self.assertFalse(self._client([(81, 't1'), (81, 't2')]).is_armed())
+
+    def test_is_armed_none_when_heartbeat_stale(self):
+        # mavlink2rest keeps serving the dead autopilot's last HEARTBEAT.
+        self.assertIsNone(self._client([(81, 'frozen')]).is_armed(timeout_s=0.05))
+        self.assertIsNone(self._client([None]).is_armed(timeout_s=0.05))
+
+    def test_wait_for_fresh_heartbeat_requires_two_updates(self):
+        client = self._client([(81, 'old'), (81, 'old'), (81, 'n1'), (81, 'n2')])
+        self.assertTrue(client.wait_for_fresh_heartbeat(timeout_s=5, poll_s=0))
+
+    def test_wait_for_fresh_heartbeat_times_out_on_frozen_stamp(self):
+        client = self._client([(81, 'old'), (81, 'n1')])  # one change only
+        self.assertFalse(client.wait_for_fresh_heartbeat(timeout_s=0.05, poll_s=0))
+
+
 if __name__ == '__main__':
     unittest.main()

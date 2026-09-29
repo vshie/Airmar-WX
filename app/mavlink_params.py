@@ -693,6 +693,79 @@ class ParamClient:
         body = (r.text or "").strip()
         return bool(body) and body != "None"
 
+    # -- HEARTBEAT freshness / armed state -----------------------------
+
+    def _heartbeat(self) -> Tuple[Optional[dict], Optional[str]]:
+        """Return ``(message, last_update)`` for the autopilot's HEARTBEAT.
+
+        mavlink2rest keeps serving the last HEARTBEAT after the autopilot
+        goes quiet, so a body alone doesn't prove it's alive; callers judge
+        freshness by `last_update` changing, like the PARAM_VALUE mailbox.
+        """
+        wrapper = self._get_json(
+            f"/mavlink/vehicles/{self.target_system}"
+            f"/components/{self.target_component}/messages/HEARTBEAT"
+        )
+        if not isinstance(wrapper, dict):
+            return None, None
+        message = wrapper.get("message")
+        stamp = (((wrapper.get("status") or {}).get("time") or {})
+                 .get("last_update"))
+        return (message if isinstance(message, dict) else None), stamp
+
+    def _fresh_heartbeat(self, timeout_s: float) -> Optional[dict]:
+        """A HEARTBEAT seen to update within `timeout_s`, else None."""
+        _, first = self._heartbeat()
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            time.sleep(0.25)
+            message, stamp = self._heartbeat()
+            if message is not None and stamp is not None and stamp != first:
+                return message
+        return None
+
+    def is_armed(self, timeout_s: float = 3.0) -> Optional[bool]:
+        """True/False from a fresh HEARTBEAT's MAV_MODE_FLAG_SAFETY_ARMED
+        (base_mode bit 128); None when the autopilot can't be seen live, so
+        callers refuse rather than guess "disarmed"."""
+        if not self.ensure_target(force=not self._target_pinned):
+            return None
+        message = self._fresh_heartbeat(timeout_s)
+        if message is None:
+            return None
+        base_mode = message.get("base_mode")
+        bits = base_mode.get("bits") if isinstance(base_mode, dict) else base_mode
+        try:
+            return bool(int(bits) & 128)
+        except (TypeError, ValueError):
+            return None
+
+    def wait_for_fresh_heartbeat(self, timeout_s: float = 120.0,
+                                 poll_s: float = 1.0) -> bool:
+        """Wait until the autopilot is heard again after a restart.
+
+        Call once the restart request has returned. The autopilot counts as
+        back after its HEARTBEAT `last_update` changes twice in a row: the
+        first stamp may be the frozen last beat of the killed process, but
+        two further changes can only come from a running one. Re-discovers
+        the target on every poll since the system id may change on boot.
+        """
+        deadline = time.monotonic() + timeout_s
+        last_target, last_stamp, changes = None, None, 0
+        while time.monotonic() < deadline:
+            if self._target_pinned or self.ensure_target(force=True):
+                target = (self.target_system, self.target_component)
+                message, stamp = self._heartbeat()
+                if target != last_target:
+                    last_target, last_stamp, changes = target, stamp, 0
+                elif message is not None and stamp is not None and stamp != last_stamp:
+                    changes += 1
+                    last_stamp = stamp
+                    if changes >= 2:
+                        return True
+            time.sleep(poll_s)
+        return False
+
     # -- higher-level operations ---------------------------------------
 
     def read_expected(self, expected: Dict[str, float]) -> Dict[str, dict]:

@@ -310,6 +310,29 @@ class GpsRouteRateMigrationTests(StreamRouteMigrationTests):
         self.assertEqual(h.state['sentence_config'], {'GGA': self.ROUTE_WRITE})
 
 
+class UndoSnapshotMigrationTests(StreamRouteMigrationTests):
+    """1.1.1: one-click setup keys must be well formed after load."""
+
+    VALID = {'created_ts': 1.0, 'board': 'Navigator',
+             'serial_changes': {'H': {'before': None, 'after': 'udpin:0.0.0.0:27002',
+                                      'route': 'gps'}},
+             'params_before': {'GPS2_TYPE': {'value': 0.0, 'resolved_name': 'GPS2_TYPE'}}}
+
+    def test_malformed_undo_snapshot_dropped(self):
+        for bad in ('x', {'serial_changes': []}, {'params_before': {'A': 1}}):
+            h = self._load_with({'autopilot_setup': {'applied': True, 'undo': bad}})
+            self.assertNotIn('undo', h.state['autopilot_setup'], bad)
+            self.assertTrue(h.state['autopilot_setup']['applied'])
+
+    def test_valid_undo_snapshot_preserved(self):
+        h = self._load_with({'autopilot_setup': {'undo': self.VALID}})
+        self.assertEqual(h.state['autopilot_setup']['undo'], self.VALID)
+
+    def test_persisted_job_key_stripped(self):
+        h = self._load_with({'autopilot_setup': {'job': {'running': True}}})
+        self.assertNotIn('job', h.state['autopilot_setup'])
+
+
 class PartialApplyTests(unittest.TestCase):
     """Step 2b: wind-only / GPS-only applies write and persist one route."""
 

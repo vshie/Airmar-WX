@@ -5,6 +5,8 @@ import serial
 import serial.tools.list_ports
 import logging
 import logging.handlers
+import copy
+import hashlib
 import json
 import socket
 import asyncio
@@ -50,6 +52,20 @@ try:
     HAS_MAVLINK_PARAMS = True
 except ImportError:
     HAS_MAVLINK_PARAMS = False
+
+try:
+    from blueos_serials import (
+        SerialsClient,
+        dead_device_entries,
+        is_supported as serials_supported,
+        plan_serial_changes,
+        plan_serial_undo,
+        udpin_endpoint,
+        validate_auto_serials,
+    )
+    HAS_BLUEOS_SERIALS = True
+except ImportError:
+    HAS_BLUEOS_SERIALS = False
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
@@ -302,6 +318,16 @@ class NMEAHandler:
             #   'ignore_drift': bool,          # user chose Ignore -> never nag
             #   'last_apply_ts': float,
             #   'last_apply_result': {...},    # per-param apply outcome
+            #   # One-click setup (BlueOS serial list + params + restart):
+            #   'undo': {                      # write-once pre-setup values
+            #     'created_ts': float, 'board': str,
+            #     'serial_changes': {letter: {'before': str|None,
+            #                                 'after': str|None, 'route': str}},
+            #     'params_before': {param: {'value': float|None,
+            #                               'resolved_name': str}},
+            #   },
+            #   'serial_auto_applied': {'ts': float, 'restarted': bool,
+            #                           'serial_changes': [...]},
             # }
             'autopilot_setup': {}
         }
@@ -337,8 +363,20 @@ class NMEAHandler:
         # writes matching ArduPilot parameters once and later checks for drift.
         self._param_client = ParamClient() if HAS_MAVLINK_PARAMS else None
         # Serialize check/apply/restore so overlapping UI clicks don't clobber
-        # each other's state.
+        # each other's state. A one-click setup/undo job holds it for its
+        # whole run (including the ArduPilot restart).
         self._autopilot_setup_lock = threading.Lock()
+        # BlueOS ardupilot-manager client for the serial list + restart.
+        self._serials_client = SerialsClient() if HAS_BLUEOS_SERIALS else None
+        # {'supported', 'reason', 'board', 'ts'}; refreshed by preview and
+        # GET /api/autopilot/setup, never on the SSE path.
+        self._serial_support = None
+        # In-memory state of the running / last one-click job.
+        self._setup_job = None
+        self._setup_job_seq = 0
+        # Pause between the last PARAM_SET and the restart so ArduPilot's
+        # storage thread has flushed the writes before the process is killed.
+        self._setup_settle_s = 3.0
         
         # Aggregated sensor data for dashboard display
         self.sensor_data = {
@@ -541,6 +579,7 @@ class NMEAHandler:
                 # drift against the correct expectation, and the operator
                 # can hit Restore to apply the new contract, or Ignore.
                 self._migrate_autopilot_setup_gps_contract()
+                self._migrate_autopilot_setup_undo_shape()
                 # Migration (1.1.10): both routes used to start automatically
                 # on every connect. Installs that already applied the
                 # ArduRover setup depend on that, so keep both on for them;
@@ -570,6 +609,29 @@ class NMEAHandler:
             self.app_logger.debug(f"Saved state: port={self.state['port']}, baud={self.state['baud_rate']}")
         except Exception as e:
             self.app_logger.error(f"Error saving state: {e}")
+
+    def _migrate_autopilot_setup_undo_shape(self):
+        """Keep the one-click setup keys well formed (1.1.1).
+
+        A malformed `undo` snapshot would make Undo crash, so drop it; the
+        job is in-memory only and must never be restored from disk.
+        """
+        setup = self.state.get('autopilot_setup')
+        if not isinstance(setup, dict):
+            return
+        changed = setup.pop('job', None) is not None
+        undo = setup.get('undo')
+        if undo is not None and not (
+                isinstance(undo, dict)
+                and isinstance(undo.get('serial_changes', {}), dict)
+                and isinstance(undo.get('params_before', {}), dict)
+                and all(isinstance(v, dict) for v in undo.get('serial_changes', {}).values())
+                and all(isinstance(v, dict) for v in undo.get('params_before', {}).values())):
+            self.app_logger.warning("Dropping malformed autopilot setup undo snapshot")
+            del setup['undo']
+            changed = True
+        if changed:
+            self.save_state()
 
     def _migrate_gps_route_rate_out_of_sentence_config(self, loaded):
         """Undo 1.1.11-1.1.14 saving the GPS route's 10 Hz as a user setting.
@@ -1496,6 +1558,10 @@ class NMEAHandler:
             'udp_gps_port': self.UDP_GPS_PORT,
             'udpin_wind_string': f'udpin:0.0.0.0:{self.UDP_WIND_PORT}',
             'udpin_gps_string': f'udpin:0.0.0.0:{self.UDP_GPS_PORT}',
+            'serial_auto': self._serial_support_public(),
+            'undo_available': bool(setup.get('undo')),
+            'serial_auto_applied': setup.get('serial_auto_applied'),
+            'job': self._setup_job_public(),
         }
 
     # ── ArduRover parameter setup ────────────────────────────────────
@@ -1569,14 +1635,17 @@ class NMEAHandler:
         ok, err = validate_selection(wind_serial, gps_serial)
         if not ok:
             return False, err, {}
-        with self._autopilot_setup_lock:
-            try:
-                result, snapshot = self._apply_and_persist(
-                    wind_serial, gps_serial, use_gps_yaw_fallback,
-                )
-            except Exception as e:
-                self.app_logger.error(f"apply_autopilot_setup failed: {e}")
-                return False, str(e), {}
+        if not self._autopilot_setup_lock.acquire(blocking=False):
+            return False, self._SETUP_BUSY, {}
+        try:
+            result, snapshot = self._apply_and_persist(
+                wind_serial, gps_serial, use_gps_yaw_fallback,
+            )
+        except Exception as e:
+            self.app_logger.error(f"apply_autopilot_setup failed: {e}")
+            return False, str(e), {}
+        finally:
+            self._autopilot_setup_lock.release()
         return True, 'applied', {
             'result': result,
             'expected': snapshot,
@@ -1603,8 +1672,12 @@ class NMEAHandler:
                 'ignore_drift': bool(setup.get('ignore_drift', False)),
                 'status': self.get_autopilot_setup_status(),
             }
-        with self._autopilot_setup_lock:
+        if not self._autopilot_setup_lock.acquire(blocking=False):
+            return False, self._SETUP_BUSY, {}
+        try:
             current = self._param_client.read_expected(expected)
+        finally:
+            self._autopilot_setup_lock.release()
         # Transport-failure short-circuit: if not one param echoed back,
         # we can't tell whether they drifted or the transport is broken.
         # Report the ambiguity honestly instead of manufacturing drift.
@@ -1642,14 +1715,17 @@ class NMEAHandler:
         ok, err = validate_selection(wind_serial, gps_serial)
         if not ok:
             return False, f'no valid setup to restore: {err}', {}
-        with self._autopilot_setup_lock:
-            try:
-                result, snapshot = self._apply_and_persist(
-                    wind_serial, gps_serial, use_gps_yaw_fallback,
-                )
-            except Exception as e:
-                self.app_logger.error(f"restore_autopilot_setup failed: {e}")
-                return False, str(e), {}
+        if not self._autopilot_setup_lock.acquire(blocking=False):
+            return False, self._SETUP_BUSY, {}
+        try:
+            result, snapshot = self._apply_and_persist(
+                wind_serial, gps_serial, use_gps_yaw_fallback,
+            )
+        except Exception as e:
+            self.app_logger.error(f"restore_autopilot_setup failed: {e}")
+            return False, str(e), {}
+        finally:
+            self._autopilot_setup_lock.release()
         return True, 'restored', {
             'result': result,
             'expected': snapshot,
@@ -1669,6 +1745,498 @@ class NMEAHandler:
             setup.get('wind_serial'), setup.get('gps_serial'),
         )
         return True, 'ignored', {'status': self.get_autopilot_setup_status()}
+
+    # ── One-click setup: BlueOS serial list + params + restart ───────
+    #
+    # On Linux autopilot boards (Navigator) the extension can also do step
+    # 2a for the user: point SERIALx at `udpin:0.0.0.0:27001/27002` through
+    # BlueOS's ardupilot-manager (see blueos_serials.py), write the params,
+    # and restart ArduPilot once so both take effect. Flow:
+    #
+    #   preview -> the user reviews every serial/param change (old -> new)
+    #   confirm -> background job: armed check, token check, write-once
+    #              `undo` snapshot, PUT serials, PARAM_SETs, settle,
+    #              restart, wait for heartbeat, verify
+    #   undo    -> same preview/confirm shape, reverting what setup changed
+    #
+    # The token (hash of the serial list + current param values + selection
+    # at preview time) makes confirm refuse if the vehicle changed since the
+    # user looked. Jobs run in a thread because the restart takes up to
+    # ~90 s and waitress threads are scarce (SSE pins some); progress goes
+    # out through `status['job']` in the 1 Hz stream_status.
+
+    _SETUP_BUSY = 'autopilot setup in progress; try again when it finishes'
+    SERIAL_SUPPORT_TTL_S = 60.0
+
+    def _serial_support_public(self):
+        s = self._serial_support
+        if not HAS_BLUEOS_SERIALS or self._serials_client is None:
+            return {'supported': False, 'reason': 'serial client not available',
+                    'board': None}
+        if s is None:
+            return {'supported': False, 'reason': 'not checked yet', 'board': None}
+        return {k: s[k] for k in ('supported', 'reason', 'board')}
+
+    def refresh_serial_support(self, force=False):
+        """Ask ardupilot-manager whether auto serial setup works here.
+        Cached; returns `(supported, reason, board, serials)`."""
+        if not HAS_BLUEOS_SERIALS or self._serials_client is None:
+            return False, 'serial client not available', None, None
+        s = self._serial_support
+        if not force and s is not None and time.time() - s['ts'] < self.SERIAL_SUPPORT_TTL_S:
+            return s['supported'], s['reason'], s['board'], None
+        board = self._serials_client.get_board()
+        serials = self._serials_client.get_serials() if board is not None else None
+        supported, reason = serials_supported(board, serials)
+        name = (board or {}).get('name')
+        self._serial_support = {'supported': supported, 'reason': reason,
+                                'board': name, 'ts': time.time()}
+        return supported, reason, name, serials
+
+    def _setup_job_public(self):
+        job = self._setup_job
+        if not job:
+            return None
+        return {k: job.get(k) for k in ('id', 'kind', 'phase', 'running', 'ok',
+                                        'message', 'started_ts', 'finished_ts',
+                                        'result')}
+
+    def get_setup_job(self):
+        return self._setup_job_public()
+
+    def _job_phase(self, phase):
+        if self._setup_job is not None:
+            self._setup_job['phase'] = phase
+
+    @staticmethod
+    def _setup_token(kind, selection, serials):
+        # Covers what a stale preview could get wrong: the whole-list PUT is
+        # built from `serials`. Param values are re-read by the job itself
+        # (mavlink2rest reads are too flaky to fingerprint).
+        blob = json.dumps({'kind': kind, 'selection': selection,
+                           'serials': serials}, sort_keys=True)
+        return hashlib.sha1(blob.encode()).hexdigest()
+
+    def _setup_prereqs(self):
+        if not HAS_MAVLINK_PARAMS or self._param_client is None:
+            return 'mavlink parameter client not available'
+        if not HAS_BLUEOS_SERIALS or self._serials_client is None:
+            return 'BlueOS serial client not available'
+        return None
+
+    def _compute_setup_plan(self, wind_serial, gps_serial, use_gps_yaw_fallback):
+        """Everything the preview shows; also recomputed by the job to check
+        the token. Returns (ok, message, plan). Caller holds the lock."""
+        use_gps_yaw_fallback = bool(use_gps_yaw_fallback) and gps_serial is not None
+        supported, reason, board, serials = self.refresh_serial_support(force=True)
+        if not supported:
+            return False, f'automatic serial setup unavailable: {reason}', {}
+        new_list, serial_changes = plan_serial_changes(
+            serials, wind_serial, gps_serial,
+            udpin_endpoint(self.UDP_WIND_PORT), udpin_endpoint(self.UDP_GPS_PORT),
+        )
+        expected = build_expected_params(wind_serial, gps_serial, use_gps_yaw_fallback)
+        current = self._param_client.read_expected(expected)
+        param_changes = []
+        for name, target in expected.items():
+            row = current.get(name) or {}
+            before = row.get('current') if row.get('available') else None
+            param_changes.append({
+                'name': name,
+                'resolved_name': row.get('resolved_name') or name,
+                'before': before,
+                'after': float(target),
+                'unknown': before is None,
+                'unchanged': bool(row.get('match')),
+            })
+        selection = {'wind_serial': wind_serial, 'gps_serial': gps_serial,
+                     'use_gps_yaw_fallback': use_gps_yaw_fallback}
+        token = self._setup_token('setup', selection, serials)
+        will_restart = (any(c['kind'] != 'unchanged' for c in serial_changes)
+                        or any(not p['unchanged'] for p in param_changes))
+        return True, 'ok', {
+            'board': board,
+            'selection': selection,
+            'serials_before': serials,
+            'serials_after': new_list,
+            'serial_changes': serial_changes,
+            'param_changes': param_changes,
+            'dead_devices': dead_device_entries(new_list),
+            'will_restart': will_restart,
+            'token': token,
+        }
+
+    def preview_serial_setup(self, wind_serial, gps_serial, use_gps_yaw_fallback):
+        err = self._setup_prereqs()
+        if err:
+            return False, err, {}
+        ok, err = validate_selection(wind_serial, gps_serial)
+        if ok:
+            ok, err = validate_auto_serials(wind_serial, gps_serial)
+        if not ok:
+            return False, err, {}
+        if not self._autopilot_setup_lock.acquire(blocking=False):
+            return False, self._SETUP_BUSY, {}
+        try:
+            ok, message, plan = self._compute_setup_plan(
+                wind_serial, gps_serial, use_gps_yaw_fallback)
+            if ok:
+                plan['armed'] = self._param_client.is_armed()
+        except Exception as e:
+            self.app_logger.error(f"preview_serial_setup failed: {e}")
+            return False, str(e), {}
+        finally:
+            self._autopilot_setup_lock.release()
+        return ok, message, {'preview': plan} if ok else {}
+
+    def _compute_undo_plan(self):
+        setup = self.state.get('autopilot_setup') or {}
+        undo = setup.get('undo') or {}
+        if not undo:
+            return False, 'nothing to undo', {}
+        supported, reason, board, serials = self.refresh_serial_support(force=True)
+        serial_snapshot = undo.get('serial_changes') or {}
+        if serial_snapshot and not supported:
+            return False, f'automatic serial setup unavailable: {reason}', {}
+        new_list, serial_rows = plan_serial_undo(serials or [], serial_snapshot)
+        param_rows = []
+        for name, rec in sorted((undo.get('params_before') or {}).items()):
+            resolved = rec.get('resolved_name') or name
+            original = rec.get('value')
+            current = self._param_client.read(resolved)
+            param_rows.append({
+                'name': name, 'resolved_name': resolved,
+                'before': current, 'after': original,
+                'unknown': original is None,
+                'unchanged': (original is not None and current is not None
+                              and abs(float(current) - float(original)) < 1e-4),
+            })
+        token = self._setup_token('undo', undo, serials or [])
+        will_restart = (any(r['kind'] in ('restore', 'remove') for r in serial_rows)
+                        or any(not p['unchanged'] and not p['unknown'] for p in param_rows))
+        return True, 'ok', {
+            'board': board,
+            'serials_before': serials or [],
+            'serials_after': new_list,
+            'serial_changes': serial_rows,
+            'param_changes': param_rows,
+            'dead_devices': dead_device_entries(new_list),
+            'will_restart': will_restart,
+            'token': token,
+        }
+
+    def preview_serial_undo(self):
+        err = self._setup_prereqs()
+        if err:
+            return False, err, {}
+        if not self._autopilot_setup_lock.acquire(blocking=False):
+            return False, self._SETUP_BUSY, {}
+        try:
+            ok, message, plan = self._compute_undo_plan()
+            if ok:
+                plan['armed'] = self._param_client.is_armed()
+        except Exception as e:
+            self.app_logger.error(f"preview_serial_undo failed: {e}")
+            return False, str(e), {}
+        finally:
+            self._autopilot_setup_lock.release()
+        return ok, message, {'preview': plan} if ok else {}
+
+    def start_setup_job(self, kind, token, drop_missing_devices=False,
+                        wind_serial=None, gps_serial=None,
+                        use_gps_yaw_fallback=False, run_async=True):
+        """Kick off a setup/undo job. The lock is taken here, synchronously,
+        so a second confirm is refused immediately; the job releases it."""
+        err = self._setup_prereqs()
+        if err:
+            return False, err, {}
+        if kind == 'setup':
+            ok, err = validate_selection(wind_serial, gps_serial)
+            if ok:
+                ok, err = validate_auto_serials(wind_serial, gps_serial)
+            if not ok:
+                return False, err, {}
+        if not self._autopilot_setup_lock.acquire(blocking=False):
+            return False, self._SETUP_BUSY, {}
+        self._setup_job_seq += 1
+        self._setup_job = {
+            'id': self._setup_job_seq, 'kind': kind, 'phase': 'checking',
+            'running': True, 'ok': None, 'message': '',
+            'started_ts': time.time(), 'finished_ts': None, 'result': None,
+        }
+        if kind == 'setup':
+            target = lambda: self._run_setup_job(
+                token, drop_missing_devices, wind_serial, gps_serial,
+                use_gps_yaw_fallback)
+        else:
+            target = lambda: self._run_undo_job(token, drop_missing_devices)
+
+        def run():
+            try:
+                ok, message, result = target()
+            except Exception as e:
+                self.app_logger.error(f"autopilot {kind} job crashed: {e}")
+                ok, message, result = False, f'unexpected error: {e}', None
+            finally:
+                self._autopilot_setup_lock.release()
+            job = self._setup_job
+            job.update({'running': False, 'ok': ok, 'message': message,
+                        'result': result, 'finished_ts': time.time(),
+                        'phase': 'done' if ok else 'failed'})
+            self.app_logger.info("Autopilot %s job %s: %s", kind,
+                                 'ok' if ok else 'FAILED', message)
+
+        if run_async:
+            threading.Thread(target=run, daemon=True,
+                             name=f'autopilot-{kind}').start()
+        else:
+            run()
+        return True, 'started', {'job': self._setup_job_public()}
+
+    def _armed_refusal(self):
+        armed = self._param_client.is_armed()
+        if armed is None:
+            return "can't hear the autopilot's heartbeat; not changing anything"
+        if armed:
+            return 'vehicle is armed; disarm it before setup (ArduPilot must restart)'
+        return None
+
+    def _drop_dead(self, plan, drop_missing_devices):
+        """(new_list, dropped) or raises ValueError when dead devices block."""
+        dead = plan['dead_devices']
+        if dead and not drop_missing_devices:
+            raise ValueError(
+                'BlueOS would reject the serial list: missing device(s) '
+                + ', '.join(f"{d['port']}={d['endpoint']}" for d in dead)
+                + '. Confirm removing them to continue.')
+        dead_ports = {d['port'] for d in dead}
+        return ([e for e in plan['serials_after'] if e['port'] not in dead_ports],
+                dead)
+
+    def _restart_and_wait(self):
+        """Restart ArduPilot and wait for its heartbeat. (ok, message)."""
+        refusal = self._armed_refusal()
+        if refusal:
+            return False, refusal + ' (changes are saved; restart ArduPilot from BlueOS when safe)'
+        self._job_phase('restarting')
+        ok, why = self._serials_client.restart()
+        if not ok:
+            return False, why + ' (changes are saved; restart ArduPilot from BlueOS)'
+        self._job_phase('waiting_autopilot')
+        if not self._param_client.wait_for_fresh_heartbeat():
+            return False, 'ArduPilot did not come back within 2 minutes of the restart'
+        return True, 'restarted'
+
+    def _run_setup_job(self, token, drop_missing_devices, wind_serial,
+                       gps_serial, use_gps_yaw_fallback):
+        """Body of the setup job. Caller holds the setup lock.
+        Returns (ok, message, result)."""
+        self._job_phase('checking')
+        refusal = self._armed_refusal()
+        if refusal:
+            return False, refusal, None
+        ok, message, plan = self._compute_setup_plan(
+            wind_serial, gps_serial, use_gps_yaw_fallback)
+        if not ok:
+            return False, message, None
+        if plan['token'] != token:
+            return False, 'the vehicle configuration changed since the preview; review it again', None
+        try:
+            new_list, dropped = self._drop_dead(plan, drop_missing_devices)
+        except ValueError as e:
+            return False, str(e), None
+        serials_before = plan['serials_before']
+        serial_changes = plan['serial_changes'] + [
+            {'serial': None, 'letter': d['port'], 'route': None,
+             'kind': 'removed-missing', 'before': d['endpoint'], 'after': None}
+            for d in dropped]
+        serials_changed = new_list != serials_before
+        params_to_write = [p for p in plan['param_changes'] if not p['unchanged']]
+
+        # Write-once undo snapshot, persisted before anything is changed so
+        # a crash mid-job still leaves Undo possible.
+        setup = self.state.get('autopilot_setup') or {}
+        prior_undo = copy.deepcopy(setup.get('undo'))
+        undo = copy.deepcopy(prior_undo) or {
+            'created_ts': time.time(), 'board': plan['board'],
+            'serial_changes': {}, 'params_before': {}}
+        for c in serial_changes:
+            if c['kind'] == 'unchanged':
+                continue
+            rec = undo['serial_changes'].get(c['letter'])
+            if rec is None:
+                undo['serial_changes'][c['letter']] = {
+                    'before': c['before'], 'after': c['after'], 'route': c['route']}
+            else:
+                rec['after'] = c['after']
+        for p in params_to_write:
+            undo['params_before'].setdefault(
+                p['name'], {'value': p['before'], 'resolved_name': p['resolved_name']})
+        setup['undo'] = undo
+        self.state['autopilot_setup'] = setup
+        self.save_state()
+
+        def forget_snapshot():
+            setup['undo'] = prior_undo
+            if not prior_undo:
+                setup.pop('undo', None)
+            self.save_state()
+
+        if serials_changed:
+            self._job_phase('writing_serials')
+            ok, why = self._serials_client.put_serials(new_list)
+            if not ok:
+                forget_snapshot()
+                return False, why, None
+
+        self._job_phase('writing_params')
+        result, expected = self._apply_and_persist(
+            wind_serial, gps_serial, use_gps_yaw_fallback)
+        needed = {p['name'] for p in params_to_write}
+        if needed and not any(result.get(n, {}).get('ok') for n in needed):
+            if serials_changed:
+                self._serials_client.put_serials(serials_before)
+            forget_snapshot()
+            return False, 'no parameter could be written to the autopilot; serial list put back', None
+        if any(r.get('action') in ('wrote', 'wrote_unverified') for r in result.values()):
+            time.sleep(self._setup_settle_s)
+
+        restarted = False
+        restart_msg = 'nothing changed; no restart needed'
+        if serials_changed or plan['will_restart']:
+            ok, restart_msg = self._restart_and_wait()
+            if not ok:
+                return False, restart_msg, self._setup_result(
+                    serial_changes, result, None, None, restarted=False)
+            restarted = True
+
+        self._job_phase('verifying')
+        verify = self._param_client.read_expected(expected) if expected else {}
+        serials_now = self._serials_client.get_serials()
+        serials_ok = serials_now == new_list
+        setup['serial_auto_applied'] = {
+            'ts': time.time(), 'restarted': restarted,
+            'serial_changes': serial_changes}
+        self.save_state()
+        drift = [n for n, r in verify.items() if r.get('available') and not r.get('match')]
+        problems = []
+        if not serials_ok:
+            problems.append('BlueOS serial list differs from what was written')
+        if drift:
+            problems.append('params not as written: ' + ', '.join(sorted(drift)))
+        message = ('setup complete' + ('; ArduPilot restarted' if restarted else '')
+                   if not problems else 'setup finished with problems: ' + '; '.join(problems))
+        return not problems, message, self._setup_result(
+            serial_changes, result, verify, serials_ok, restarted)
+
+    @staticmethod
+    def _setup_result(serial_changes, apply_result, verify, serials_ok, restarted):
+        params = []
+        for name, row in (apply_result or {}).items():
+            v = (verify or {}).get(name) or {}
+            params.append({
+                'name': name, 'before': row.get('previous'), 'after': row.get('target'),
+                'action': row.get('action'), 'ok': bool(row.get('ok')),
+                'reason': row.get('reason') or '',
+                'verified': v.get('match') if v else None,
+            })
+        return {'serial_changes': serial_changes, 'param_changes': params,
+                'serials_ok': serials_ok, 'restarted': restarted}
+
+    def _run_undo_job(self, token, drop_missing_devices):
+        """Body of the undo job. Caller holds the setup lock."""
+        self._job_phase('checking')
+        refusal = self._armed_refusal()
+        if refusal:
+            return False, refusal, None
+        ok, message, plan = self._compute_undo_plan()
+        if not ok:
+            return False, message, None
+        if plan['token'] != token:
+            return False, 'the vehicle configuration changed since the preview; review it again', None
+        try:
+            new_list, dropped = self._drop_dead(plan, drop_missing_devices)
+        except ValueError as e:
+            return False, str(e), None
+        serials_changed = new_list != plan['serials_before']
+        if serials_changed:
+            self._job_phase('writing_serials')
+            ok, why = self._serials_client.put_serials(new_list)
+            if not ok:
+                return False, why, None
+
+        self._job_phase('writing_params')
+        param_rows = []
+        failed = []
+        wrote_any = False
+        for p in plan['param_changes']:
+            row = dict(p)
+            if p['unknown']:
+                row['action'] = 'skipped_unknown'
+            elif p['unchanged']:
+                row['action'] = 'noop'
+            else:
+                posted, why, verified = self._param_client.write(
+                    p['resolved_name'], p['after'])
+                wrote_any = wrote_any or posted
+                row['action'] = ('wrote' if verified else 'wrote_unverified') if posted else 'failed'
+                row['reason'] = '' if verified else why
+                if not posted:
+                    failed.append(p['name'])
+            param_rows.append(row)
+        if wrote_any:
+            time.sleep(self._setup_settle_s)
+
+        restarted = False
+        if serials_changed or wrote_any:
+            ok, restart_msg = self._restart_and_wait()
+            if not ok:
+                return False, restart_msg, {'serial_changes': plan['serial_changes'],
+                                            'param_changes': param_rows,
+                                            'restarted': False}
+            restarted = True
+
+        self._job_phase('verifying')
+        for row in param_rows:
+            if row['action'] in ('wrote', 'wrote_unverified'):
+                now = self._param_client.read(row['resolved_name'])
+                row['verified'] = (now is not None
+                                   and abs(float(now) - float(row['after'])) < 1e-4)
+        serials_ok = self._serials_client.get_serials() == new_list
+
+        # Setup is undone: forget the applied contract so drift checks stop.
+        setup = self.state.get('autopilot_setup') or {}
+        for key in ('applied', 'ignore_drift'):
+            setup[key] = False
+        for key in ('expected', 'last_apply_result'):
+            setup[key] = {}
+        setup.pop('serial_auto_applied', None)
+        undo = setup.get('undo') or {}
+        remaining = {n: undo['params_before'][n] for n in failed
+                     if n in (undo.get('params_before') or {})}
+        if remaining:
+            undo['serial_changes'] = {}
+            undo['params_before'] = remaining
+            setup['undo'] = undo
+        else:
+            setup.pop('undo', None)
+        self.state['autopilot_setup'] = setup
+        self.save_state()
+
+        problems = []
+        if failed:
+            problems.append('could not write ' + ', '.join(failed) + ' (Undo can be retried)')
+        if not serials_ok:
+            problems.append('BlueOS serial list differs from what was written')
+        message = ('setup undone' + ('; ArduPilot restarted' if restarted else '')
+                   if not problems else 'undo finished with problems: ' + '; '.join(problems))
+        serial_rows = plan['serial_changes'] + [
+            {'serial': None, 'letter': d['port'], 'kind': 'removed-missing',
+             'before': d['endpoint'], 'after': None} for d in dropped]
+        return not problems, message, {'serial_changes': serial_rows,
+                                       'param_changes': param_rows,
+                                       'serials_ok': serials_ok,
+                                       'restarted': restarted}
 
     def get_mavlink_nvf_status(self):
         """Diagnostics for the NAMED_VALUE_FLOAT publisher, for the UI / SSE."""
@@ -3307,6 +3875,9 @@ def get_streaming_status():
 @app.route('/api/autopilot/setup', methods=['GET'])
 def get_autopilot_setup():
     """Return persisted ArduRover setup snapshot (SERIAL X/Y, flags, expected)."""
+    # Not on the SSE path, so it may ask BlueOS (cached) whether one-click
+    # serial setup is available on this board.
+    nmea_handler.refresh_serial_support()
     return jsonify({
         "success": True,
         "status": nmea_handler.get_autopilot_setup_status(),
@@ -3347,6 +3918,52 @@ def ignore_autopilot_drift():
     """Silence the drift banner permanently for the current SERIAL X/Y pair."""
     ok, message, payload = nmea_handler.ignore_autopilot_drift()
     return jsonify({"success": ok, "message": message, **payload})
+
+def _setup_selection(data):
+    return (data.get('wind_serial'), data.get('gps_serial'),
+            bool(data.get('use_gps_yaw_fallback', False)))
+
+@app.route('/api/autopilot/setup/preview', methods=['POST'])
+def preview_autopilot_serial_setup():
+    """What one-click setup would change: BlueOS serial list + params.
+
+    Body: same as POST /api/autopilot/setup. Returns `preview` with
+    serial_changes, param_changes, dead_devices, armed, will_restart, token.
+    """
+    data = request.get_json(silent=True) or {}
+    ok, message, payload = nmea_handler.preview_serial_setup(*_setup_selection(data))
+    return jsonify({"success": ok, "message": message, **payload})
+
+@app.route('/api/autopilot/setup/confirm', methods=['POST'])
+def confirm_autopilot_serial_setup():
+    """Start the setup job for a reviewed preview.
+
+    Body: selection + {"token": str, "drop_missing_devices": bool}.
+    Progress is reported in status.job (SSE / GET /api/autopilot/job).
+    """
+    data = request.get_json(silent=True) or {}
+    wind, gps, yaw = _setup_selection(data)
+    ok, message, payload = nmea_handler.start_setup_job(
+        'setup', data.get('token'), bool(data.get('drop_missing_devices', False)),
+        wind, gps, yaw)
+    return jsonify({"success": ok, "message": message, **payload})
+
+@app.route('/api/autopilot/undo/preview', methods=['POST'])
+def preview_autopilot_undo():
+    """What Undo would put back (serials + params captured before setup)."""
+    ok, message, payload = nmea_handler.preview_serial_undo()
+    return jsonify({"success": ok, "message": message, **payload})
+
+@app.route('/api/autopilot/undo/confirm', methods=['POST'])
+def confirm_autopilot_undo():
+    data = request.get_json(silent=True) or {}
+    ok, message, payload = nmea_handler.start_setup_job(
+        'undo', data.get('token'), bool(data.get('drop_missing_devices', False)))
+    return jsonify({"success": ok, "message": message, **payload})
+
+@app.route('/api/autopilot/job', methods=['GET'])
+def get_autopilot_job():
+    return jsonify({"success": True, "job": nmea_handler.get_setup_job()})
 
 @app.route('/api/mavlink/nvf_status', methods=['GET'])
 def mavlink_nvf_status():

@@ -11,6 +11,10 @@
   <script src="/static/vendor/js/vuetify.min.js"></script>
   <script src="/static/vendor/js/axios.min.js"></script>
   <style>
+    .setup-table { border-collapse: collapse; font-size: 13px; width: 100%; }
+    .setup-table th { text-align: left; font-weight: 500; opacity: 0.7; padding: 2px 8px 2px 0; }
+    .setup-table td { padding: 2px 8px 2px 0; vertical-align: top; word-break: break-all; }
+    .setup-table tr.setup-row-warn td { background: rgba(255, 152, 0, 0.12); }
     /* Dashboard tile styles */
     .sensor-tile {
       background: white;
@@ -798,6 +802,30 @@
                       </v-card-title>
                       <v-card-text>
 
+                        <!-- One-click setup (Linux autopilot boards): the
+                             extension edits BlueOS's serial list itself, so
+                             the manual step 2a is tucked away. -->
+                        <v-alert v-if="serialAutoSupported" type="info" text dense class="mb-3">
+                          Choose the serial ports below and click <strong>Set up</strong>.
+                          You'll see every change first. Confirming sets the BlueOS serial
+                          ports and the ArduRover parameters, then restarts ArduPilot once
+                          (the vehicle must be disarmed). <strong>Undo</strong> puts back
+                          what was there before.
+                        </v-alert>
+                        <div v-else-if="serialAutoReason" class="text-caption grey--text mb-3">
+                          Automatic serial setup isn't available ({{ serialAutoReason }}),
+                          so follow steps 2a and 2b.
+                        </div>
+                        <v-btn
+                          v-if="serialAutoSupported"
+                          x-small text class="mb-2 px-0"
+                          @click="showManualSerialSetup = !showManualSerialSetup"
+                        >
+                          <v-icon x-small left>{{ showManualSerialSetup ? 'mdi-chevron-down' : 'mdi-chevron-right' }}</v-icon>
+                          Manual serial setup (advanced)
+                        </v-btn>
+
+                        <div v-if="!serialAutoSupported || showManualSerialSetup">
                         <!-- 2a: BlueOS serial-port mapping (manual). -->
                         <div class="text-overline mb-2">2a &mdash; BlueOS Autopilot Firmware &rarr; Serial port configuration</div>
                         <div class="text-caption grey--text mb-3">
@@ -840,15 +868,24 @@
                         </div>
 
                         <v-divider class="mb-3"></v-divider>
+                        </div>
 
                         <!-- 2b: extension applies the ArduPilot parameters. -->
-                        <div class="text-overline mb-2">2b &mdash; Apply ArduRover parameters</div>
+                        <div class="text-overline mb-2">{{ serialAutoSupported ? 'Serial ports and ArduRover parameters' : '2b \u2014 Apply ArduRover parameters' }}</div>
                         <div class="text-caption grey--text mb-3">
-                          Pick the SERIAL port you used in step&nbsp;2a for each stream,
-                          or <em>Not used</em> to skip it &mdash; you can set up wind only,
-                          GPS only, or both. Clicking Apply writes and verifies the
-                          matching ArduPilot parameters via mavlink2rest; parameters for
-                          a stream set to <em>Not used</em> are left untouched. For GPS, the Airmar is wired as
+                          <template v-if="serialAutoSupported">
+                            Pick the SERIAL port for each stream, or <em>Not used</em> to
+                            skip it &mdash; you can set up wind only, GPS only, or both.
+                            <em>Parameters only</em> writes just the ArduPilot parameters
+                            and leaves the BlueOS serial ports alone.
+                          </template>
+                          <template v-else>
+                            Pick the SERIAL port you used in step&nbsp;2a for each stream,
+                            or <em>Not used</em> to skip it &mdash; you can set up wind only,
+                            GPS only, or both. Clicking Apply writes and verifies the
+                            matching ArduPilot parameters via mavlink2rest; parameters for
+                            a stream set to <em>Not used</em> are left untouched.
+                          </template> For GPS, the Airmar is wired as
                           <code>GPS2_TYPE&nbsp;=&nbsp;5</code>&nbsp;(NMEA); the vehicle's onboard
                           GPS stays on <code>GPS1_TYPE&nbsp;=&nbsp;1</code>&nbsp;(AUTO) so the
                           stock u-Blox keeps working. If parameters drift later,
@@ -906,13 +943,25 @@
 
                         <div class="d-flex flex-wrap align-center mt-3" style="gap: 8px;">
                           <v-btn
+                            v-if="serialAutoSupported"
                             color="primary"
+                            :loading="setupPreviewLoading"
+                            :disabled="!autopilotSetupFormValid || !serialAutoSelectionOk"
+                            @click="previewAutopilotSetup"
+                          >
+                            <v-icon left>mdi-auto-fix</v-icon>
+                            Set up
+                          </v-btn>
+                          <v-btn
+                            :color="serialAutoSupported ? undefined : 'primary'"
+                            :text="serialAutoSupported"
                             :loading="autopilotBusy"
                             :disabled="!autopilotSetupFormValid"
                             @click="applyAutopilotSetup"
                           >
                             <v-icon left>mdi-content-save-cog</v-icon>
-                            {{ autopilotSetup.applied ? 'Re-apply' : 'Apply parameters' }}
+                            {{ serialAutoSupported ? 'Parameters only'
+                               : (autopilotSetup.applied ? 'Re-apply' : 'Apply parameters') }}
                           </v-btn>
                           <v-btn
                             text
@@ -922,7 +971,141 @@
                             <v-icon left>mdi-refresh</v-icon>
                             Check
                           </v-btn>
+                          <v-btn
+                            v-if="autopilotSetup.undo_available"
+                            text
+                            color="warning"
+                            :loading="undoPreviewLoading"
+                            :disabled="autopilotBusy || setupJobRunning"
+                            @click="previewAutopilotUndo"
+                          >
+                            <v-icon left>mdi-undo</v-icon>
+                            Undo serial and parameter setup
+                          </v-btn>
                         </div>
+                        <div v-if="serialAutoSupported && !serialAutoSelectionOk" class="text-caption warning--text mt-1">
+                          Set up can only configure SERIAL1&ndash;7; use Parameters only for other ports.
+                        </div>
+
+                        <div v-if="setupJobRunning" class="mt-3">
+                          <div class="text-caption mb-1">{{ setupJobPhaseLabel }}</div>
+                          <v-progress-linear indeterminate color="primary"></v-progress-linear>
+                        </div>
+
+                        <v-alert
+                          v-if="setupJobResultVisible"
+                          :type="autopilotSetup.job.ok ? 'success' : 'error'"
+                          text
+                          dense
+                          dismissible
+                          class="mt-3 mb-0"
+                          @input="dismissedSetupJobId = autopilotSetup.job.id"
+                        >
+                          <div>{{ autopilotSetup.job.message }}</div>
+                          <template v-if="autopilotSetup.job.result">
+                            <table class="setup-table mt-2">
+                              <tr v-for="c in autopilotSetup.job.result.serial_changes" :key="'s' + c.letter + c.kind">
+                                <td>{{ setupSerialName(c) }}</td>
+                                <td><code>{{ c.before || '\u2014' }}</code></td>
+                                <td>&rarr;</td>
+                                <td><code>{{ c.after || '\u2014' }}</code></td>
+                                <td class="grey--text">{{ setupKindLabel(c.kind) }}</td>
+                              </tr>
+                              <tr v-for="p in autopilotSetup.job.result.param_changes" :key="'p' + p.name">
+                                <td><code>{{ p.name }}</code></td>
+                                <td>{{ formatSetupValue(p.before) }}</td>
+                                <td>&rarr;</td>
+                                <td>{{ formatSetupValue(p.after) }}</td>
+                                <td :class="p.action === 'failed' ? 'error--text' : 'grey--text'">
+                                  {{ setupActionLabel(p) }}
+                                </td>
+                              </tr>
+                            </table>
+                          </template>
+                        </v-alert>
+
+                        <!-- Preview / confirm. Only rendered while open. -->
+                        <v-dialog v-if="setupPreview" :value="true" max-width="820" persistent scrollable>
+                          <v-card>
+                            <v-card-title class="text-h6">
+                              {{ setupPreview.kind === 'undo' ? 'Undo serial and parameter setup' : 'Review setup changes' }}
+                            </v-card-title>
+                            <v-card-text>
+                              <div class="text-overline">BlueOS serial ports</div>
+                              <table class="setup-table mb-3" v-if="setupPreview.serial_changes.length">
+                                <tr>
+                                  <th>Port</th><th>Now</th><th></th><th>After</th><th></th>
+                                </tr>
+                                <tr v-for="c in setupPreview.serial_changes" :key="c.letter + c.kind"
+                                    :class="setupRowClass(c.kind)">
+                                  <td>{{ setupSerialName(c) }}</td>
+                                  <td><code>{{ c.before || '\u2014' }}</code></td>
+                                  <td>&rarr;</td>
+                                  <td><code>{{ c.after || '\u2014' }}</code></td>
+                                  <td>
+                                    <v-icon v-if="setupRowClass(c.kind)" x-small color="warning">mdi-alert</v-icon>
+                                    {{ setupKindLabel(c.kind) }}
+                                  </td>
+                                </tr>
+                              </table>
+                              <div v-else class="text-caption grey--text mb-3">No serial port changes.</div>
+
+                              <div class="text-overline">ArduRover parameters</div>
+                              <table class="setup-table mb-3" v-if="setupPreview.param_changes.length">
+                                <tr><th>Parameter</th><th>Now</th><th></th><th>After</th><th></th></tr>
+                                <tr v-for="p in setupPreview.param_changes" :key="p.name"
+                                    :class="p.unchanged ? 'grey--text' : ''">
+                                  <td><code>{{ p.name }}</code></td>
+                                  <td>{{ formatSetupValue(p.before) }}</td>
+                                  <td>&rarr;</td>
+                                  <td>{{ formatSetupValue(p.after) }}</td>
+                                  <td class="text-caption">
+                                    <span v-if="p.unchanged">no change</span>
+                                    <span v-else-if="setupPreview.kind === 'undo' && p.unknown" class="warning--text">
+                                      original unknown; left as is
+                                    </span>
+                                    <span v-else-if="p.unknown" class="warning--text">
+                                      couldn't read; Undo can't restore it
+                                    </span>
+                                  </td>
+                                </tr>
+                              </table>
+                              <div v-else class="text-caption grey--text mb-3">No parameter changes.</div>
+
+                              <v-alert v-if="setupPreview.armed === true" type="error" dense text class="mb-2">
+                                The vehicle is armed. Disarm it first: ArduPilot has to restart.
+                              </v-alert>
+                              <v-alert v-else-if="setupPreview.armed == null" type="warning" dense text class="mb-2">
+                                Can't hear the autopilot's heartbeat, so it can't be checked for being disarmed.
+                              </v-alert>
+                              <v-alert v-if="setupPreview.will_restart" type="info" dense text class="mb-2">
+                                Confirming restarts ArduPilot once. Telemetry drops for a few seconds.
+                              </v-alert>
+                              <v-alert v-if="setupPreview.dead_devices.length" type="warning" dense text class="mb-2">
+                                BlueOS lists devices that are no longer connected, and won't save the
+                                serial list while they're in it:
+                                <span v-for="d in setupPreview.dead_devices" :key="d.port">
+                                  <code>{{ d.endpoint }}</code>
+                                </span>
+                                <v-checkbox v-model="setupDropMissing" dense hide-details
+                                            label="Remove the missing devices from the list"></v-checkbox>
+                              </v-alert>
+                            </v-card-text>
+                            <v-card-actions>
+                              <v-spacer></v-spacer>
+                              <v-btn text @click="setupPreview = null">Cancel</v-btn>
+                              <v-btn
+                                :color="setupPreview.kind === 'undo' ? 'warning' : 'primary'"
+                                :loading="setupConfirming"
+                                :disabled="setupPreview.armed !== false ||
+                                           (setupPreview.dead_devices.length > 0 && !setupDropMissing)"
+                                @click="confirmSetupPreview"
+                              >
+                                {{ setupPreview.kind === 'undo' ? 'Undo' : 'Confirm' }}
+                              </v-btn>
+                            </v-card-actions>
+                          </v-card>
+                        </v-dialog>
 
                         <!-- Transport-failure banner: mavlink2rest didn't
                              echo any params back, so we can't say whether
@@ -2001,8 +2184,19 @@
           min_serial_index: 1,
           max_serial_index: 9,
           udpin_wind_string: 'udpin:0.0.0.0:27001',
-          udpin_gps_string: 'udpin:0.0.0.0:27002'
+          udpin_gps_string: 'udpin:0.0.0.0:27002',
+          serial_auto: { supported: false, reason: '', board: null },
+          undo_available: false,
+          job: null
         },
+        // One-click setup / undo preview being reviewed (null = dialog closed).
+        setupPreview: null,
+        setupPreviewLoading: false,
+        undoPreviewLoading: false,
+        setupConfirming: false,
+        setupDropMissing: false,
+        dismissedSetupJobId: null,
+        showManualSerialSetup: false,
         // Local edit state for the setup form (not applied until user clicks).
         autopilotSetupForm: {
           wind_serial: 0,   // 0 = Not used
@@ -2164,7 +2358,42 @@
         autopilotSetupFormValid() {
           const a = this.autopilotSetupForm.wind_serial;
           const b = this.autopilotSetupForm.gps_serial;
-          return !this.autopilotBusy && (!!a || !!b) && !this.autopilotSetupSameSerialError;
+          return !this.autopilotBusy && !this.setupJobRunning &&
+                 (!!a || !!b) && !this.autopilotSetupSameSerialError;
+        },
+        serialAutoSupported() {
+          const s = this.autopilotSetup.serial_auto;
+          return !!(s && s.supported);
+        },
+        serialAutoReason() {
+          const s = this.autopilotSetup.serial_auto;
+          return (s && !s.supported && s.reason && s.reason !== 'not checked yet') ? s.reason : '';
+        },
+        // BlueOS can only map SERIAL1..7.
+        serialAutoSelectionOk() {
+          const ok = n => !n || (n >= 1 && n <= 7);
+          return ok(this.autopilotSetupForm.wind_serial) && ok(this.autopilotSetupForm.gps_serial);
+        },
+        setupJobRunning() {
+          const j = this.autopilotSetup.job;
+          return !!(j && j.running);
+        },
+        setupJobPhaseLabel() {
+          const j = this.autopilotSetup.job || {};
+          const labels = {
+            checking: 'Checking the vehicle…',
+            writing_serials: 'Saving BlueOS serial ports…',
+            writing_params: 'Writing ArduRover parameters…',
+            restarting: 'Restarting ArduPilot…',
+            waiting_autopilot: 'Waiting for ArduPilot to come back…',
+            verifying: 'Verifying…'
+          };
+          const what = j.kind === 'undo' ? 'Undo: ' : 'Setup: ';
+          return what + (labels[j.phase] || j.phase || '');
+        },
+        setupJobResultVisible() {
+          const j = this.autopilotSetup.job;
+          return !!(j && !j.running && j.finished_ts && j.id !== this.dismissedSetupJobId);
         },
         autopilotSetupScreenshotSrc() {
           return '/static/images/blueos-serial-config.png';
@@ -2372,6 +2601,9 @@
             localStorage.setItem('wx200_sparklines', JSON.stringify(newVal));
           },
           deep: true
+        },
+        setupJobRunning(running, was) {
+          if (was && !running) this.checkAutopilotSetup();
         },
         // Refresh logs info when switching to Logs tab; load history on Dashboard
         activeTab(newVal) {
@@ -3328,6 +3560,119 @@
             this.autopilotBusy = false;
           }
         },
+        setupSelectionPayload() {
+          return {
+            wind_serial: this.autopilotSetupForm.wind_serial || null,
+            gps_serial: this.autopilotSetupForm.gps_serial || null,
+            use_gps_yaw_fallback: !!this.autopilotSetupForm.gps_serial &&
+                                  !!this.autopilotSetupForm.use_gps_yaw_fallback
+          };
+        },
+        async previewAutopilotSetup() {
+          if (!this.autopilotSetupFormValid) return;
+          this.setupPreviewLoading = true;
+          this.autopilotSetupMessage = '';
+          try {
+            const sel = this.setupSelectionPayload();
+            const r = await axios.post('/api/autopilot/setup/preview', sel);
+            if (r.data && r.data.success) {
+              this.setupDropMissing = false;
+              this.setupPreview = Object.freeze(
+                Object.assign({ kind: 'setup', selection: sel }, r.data.preview));
+            } else {
+              this.autopilotSetupOk = false;
+              this.autopilotSetupMessage = (r.data && r.data.message) || 'Preview failed';
+            }
+          } catch (e) {
+            this.autopilotSetupOk = false;
+            this.autopilotSetupMessage = e.message || 'Preview failed';
+          } finally {
+            this.setupPreviewLoading = false;
+          }
+        },
+        async previewAutopilotUndo() {
+          this.undoPreviewLoading = true;
+          this.autopilotSetupMessage = '';
+          try {
+            const r = await axios.post('/api/autopilot/undo/preview');
+            if (r.data && r.data.success) {
+              this.setupDropMissing = false;
+              this.setupPreview = Object.freeze(Object.assign({ kind: 'undo' }, r.data.preview));
+            } else {
+              this.autopilotSetupOk = false;
+              this.autopilotSetupMessage = (r.data && r.data.message) || 'Undo preview failed';
+            }
+          } catch (e) {
+            this.autopilotSetupOk = false;
+            this.autopilotSetupMessage = e.message || 'Undo preview failed';
+          } finally {
+            this.undoPreviewLoading = false;
+          }
+        },
+        async confirmSetupPreview() {
+          const p = this.setupPreview;
+          if (!p) return;
+          this.setupConfirming = true;
+          try {
+            const body = Object.assign({}, p.kind === 'setup' ? p.selection : {}, {
+              token: p.token,
+              drop_missing_devices: this.setupDropMissing
+            });
+            const url = p.kind === 'undo' ? '/api/autopilot/undo/confirm' : '/api/autopilot/setup/confirm';
+            const r = await axios.post(url, body);
+            if (r.data && r.data.success) {
+              this.setupPreview = null;
+              // Progress then arrives with the 1 Hz stream status.
+              if (r.data.job) {
+                this.autopilotSetup = Object.assign({}, this.autopilotSetup, { job: r.data.job });
+              }
+            } else {
+              this.autopilotSetupOk = false;
+              this.autopilotSetupMessage = (r.data && r.data.message) || 'Could not start';
+              this.setupPreview = null;
+            }
+          } catch (e) {
+            this.autopilotSetupOk = false;
+            this.autopilotSetupMessage = e.message || 'Could not start';
+          } finally {
+            this.setupConfirming = false;
+          }
+        },
+        setupSerialName(c) {
+          return c.serial ? 'SERIAL' + c.serial : '-' + c.letter;
+        },
+        setupKindLabel(kind) {
+          return {
+            set: 'new',
+            replaced: 'replaces existing',
+            'moved-from': 'removed (moved to our port)',
+            unchanged: 'no change',
+            'removed-missing': 'removed (device missing)',
+            restore: 'restored',
+            remove: 'removed',
+            skipped_changed: 'left alone (changed since setup)',
+            skipped_missing_device: 'left alone (device missing)'
+          }[kind] || kind;
+        },
+        setupRowClass(kind) {
+          return ['replaced', 'moved-from', 'removed-missing', 'skipped_changed',
+                  'skipped_missing_device'].includes(kind) ? 'setup-row-warn' : '';
+        },
+        setupActionLabel(p) {
+          const labels = {
+            noop: 'already set', wrote: 'written', wrote_unverified: 'written (unverified)',
+            failed: 'failed', skipped_unknown: 'original unknown; left as is'
+          };
+          let s = labels[p.action] || p.action || '';
+          if (p.verified === true) s += ', verified';
+          if (p.verified === false) s += ', NOT verified';
+          return s;
+        },
+        formatSetupValue(v) {
+          if (v === null || v === undefined) return 'unknown';
+          const n = Number(v);
+          return isFinite(n) ? String(Math.round(n * 10000) / 10000) : String(v);
+        },
         async checkAutopilotSetup() {
           try {
             const r = await axios.get('/api/autopilot/check');
@@ -3888,7 +4233,8 @@
         // manual param changes made outside this extension (Mission Planner,
         // Cockpit param editor, etc).
         this._autopilotCheckTimer = setInterval(() => {
-          if (!document.hidden && this.autopilotSetup.applied && !this.autopilotBusy) {
+          if (!document.hidden && this.autopilotSetup.applied && !this.autopilotBusy &&
+              !this.setupJobRunning) {
             this.checkAutopilotSetup();
           }
         }, 30000);

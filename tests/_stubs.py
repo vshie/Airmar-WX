@@ -95,6 +95,9 @@ def _fake_requests():
         def get(self, *a, **k):
             raise RuntimeError('_fake_requests.Session.get called in tests')
 
+        def put(self, *a, **k):
+            raise RuntimeError('_fake_requests.Session.put called in tests')
+
     mod.Session = _Session
     return mod
 
