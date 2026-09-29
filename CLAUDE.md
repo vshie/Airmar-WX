@@ -28,6 +28,8 @@ Frontend vendor assets (Vue 2.7, Vuetify 2.7, axios, MDI, Roboto) are downloaded
 
 Each change ships as a patch bump, and the version lives in three places that must stay in sync: `Dockerfile` (`LABEL org.blueos.version` and `LABEL version`) and `app/pyproject.toml`. Commit messages end with the version in parentheses, e.g. `... (1.1.8)`.
 
+BlueOS Store releases are git tags with no `v` prefix (`1.0.0`, `1.0.1`, `1.1.0`) on a commit whose labels carry the same version; the deploy action publishes the image under the tag name. Patch bumps continue from the last release (after `1.1.0`, the next change is `1.1.1`).
+
 ## Architecture
 
 - `app/main.py` — nearly everything. A single `NMEAHandler` instance (module global `nmea_handler`) owns all state and threads; Flask routes at the bottom of the file are thin wrappers around its methods. Served by waitress with 16 threads because each SSE client (`/api/events`) pins a worker.
