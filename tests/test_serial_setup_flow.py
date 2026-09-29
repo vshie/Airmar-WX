@@ -7,6 +7,8 @@ the persisted undo snapshot, is exercised without threads or HTTP.
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -297,13 +299,39 @@ class SetupFlowTests(FlowTestBase):
         self.assertFalse(ok)
         self.assertIn('SERIAL8', msg)
 
-    def test_second_job_rejected_while_running(self):
+    def test_second_job_rejected_at_once_while_a_job_runs(self):
+        self.h.SETUP_LOCK_WAIT_S = 5
+        self.h.state['autopilot_setup'] = {'applied': True, 'expected': {'GPS2_TYPE': 5.0}}
         self.h._autopilot_setup_lock.acquire()
+        self.h._setup_job = {'id': 1, 'running': True}
         try:
+            t0 = time.monotonic()
             ok, msg, _ = self.h.start_setup_job('undo', 'x', run_async=False)
             self.assertFalse(ok)
             self.assertIn('in progress', msg)
             ok, msg, _ = self.h.check_autopilot_setup()
+            self.assertFalse(ok)
+            self.assertLess(time.monotonic() - t0, 1, 'must not wait out a job')
+        finally:
+            self.h._autopilot_setup_lock.release()
+
+    def test_confirm_waits_for_a_running_check(self):
+        # Regression (1.1.1 on the vehicle): the UI's 30 s background Check
+        # held the lock and a Confirm clicked meanwhile was refused.
+        p = self.preview()
+        self.h._autopilot_setup_lock.acquire()
+        threading.Timer(0.2, self.h._autopilot_setup_lock.release).start()
+        job = self.confirm(p)
+        self.assertTrue(job['ok'], job['message'])
+        self.assertEqual(self.serials.restarts, 1)
+
+    def test_short_operations_give_up_after_the_wait(self):
+        self.h.SETUP_LOCK_WAIT_S = 0.05
+        self.h._autopilot_setup_lock.acquire()
+        try:
+            ok, msg, _ = self.h.preview_serial_setup(6, 7, False)
+            self.assertFalse(ok)
+            self.assertIn('in progress', msg)
         finally:
             self.h._autopilot_setup_lock.release()
 

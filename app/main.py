@@ -1635,7 +1635,7 @@ class NMEAHandler:
         ok, err = validate_selection(wind_serial, gps_serial)
         if not ok:
             return False, err, {}
-        if not self._autopilot_setup_lock.acquire(blocking=False):
+        if not self._acquire_setup_lock():
             return False, self._SETUP_BUSY, {}
         try:
             result, snapshot = self._apply_and_persist(
@@ -1672,7 +1672,7 @@ class NMEAHandler:
                 'ignore_drift': bool(setup.get('ignore_drift', False)),
                 'status': self.get_autopilot_setup_status(),
             }
-        if not self._autopilot_setup_lock.acquire(blocking=False):
+        if not self._acquire_setup_lock():
             return False, self._SETUP_BUSY, {}
         try:
             current = self._param_client.read_expected(expected)
@@ -1715,7 +1715,7 @@ class NMEAHandler:
         ok, err = validate_selection(wind_serial, gps_serial)
         if not ok:
             return False, f'no valid setup to restore: {err}', {}
-        if not self._autopilot_setup_lock.acquire(blocking=False):
+        if not self._acquire_setup_lock():
             return False, self._SETUP_BUSY, {}
         try:
             result, snapshot = self._apply_and_persist(
@@ -1767,6 +1767,22 @@ class NMEAHandler:
 
     _SETUP_BUSY = 'autopilot setup in progress; try again when it finishes'
     SERIAL_SUPPORT_TTL_S = 60.0
+    # Longest a short operation (check / preview / apply / confirm) waits
+    # for another short one to finish. A param Check reads ~9 params and
+    # usually takes a second or two, and the UI runs one every 30 s, so
+    # refusing outright made a Confirm clicked at the wrong moment fail.
+    SETUP_LOCK_WAIT_S = 30.0
+
+    def _acquire_setup_lock(self):
+        """Take the setup lock, waiting out short operations.
+
+        A running setup/undo job (which holds the lock through an ArduPilot
+        restart, up to minutes) is refused at once instead.
+        """
+        job = self._setup_job
+        if job and job.get('running'):
+            return False
+        return self._autopilot_setup_lock.acquire(timeout=self.SETUP_LOCK_WAIT_S)
 
     def _serial_support_public(self):
         s = self._serial_support
@@ -1875,7 +1891,7 @@ class NMEAHandler:
             ok, err = validate_auto_serials(wind_serial, gps_serial)
         if not ok:
             return False, err, {}
-        if not self._autopilot_setup_lock.acquire(blocking=False):
+        if not self._acquire_setup_lock():
             return False, self._SETUP_BUSY, {}
         try:
             ok, message, plan = self._compute_setup_plan(
@@ -1929,7 +1945,7 @@ class NMEAHandler:
         err = self._setup_prereqs()
         if err:
             return False, err, {}
-        if not self._autopilot_setup_lock.acquire(blocking=False):
+        if not self._acquire_setup_lock():
             return False, self._SETUP_BUSY, {}
         try:
             ok, message, plan = self._compute_undo_plan()
@@ -1956,7 +1972,7 @@ class NMEAHandler:
                 ok, err = validate_auto_serials(wind_serial, gps_serial)
             if not ok:
                 return False, err, {}
-        if not self._autopilot_setup_lock.acquire(blocking=False):
+        if not self._acquire_setup_lock():
             return False, self._SETUP_BUSY, {}
         self._setup_job_seq += 1
         self._setup_job = {

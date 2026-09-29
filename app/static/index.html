@@ -4233,8 +4233,10 @@
         // manual param changes made outside this extension (Mission Planner,
         // Cockpit param editor, etc).
         this._autopilotCheckTimer = setInterval(() => {
+          // Not while a setup preview is open or running: the check holds the
+          // server's setup lock, which would make the Confirm wait for it.
           if (!document.hidden && this.autopilotSetup.applied && !this.autopilotBusy &&
-              !this.setupJobRunning) {
+              !this.setupJobRunning && !this.setupPreview) {
             this.checkAutopilotSetup();
           }
         }, 30000);
