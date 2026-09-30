@@ -923,12 +923,14 @@
                           dense
                           hide-details
                           class="mt-3"
-                          label="Also use Airmar heading as primary yaw with compass fallback (sets EK3_SRC1_YAW=3)"
+                          label="Also use Airmar heading as GPS yaw with compass fallback (sets EK3_SRC1_YAW=3)"
                         ></v-checkbox>
                         <div class="text-caption grey--text mt-1">
-                          Off by default. Airmar HDT is a magnetometer-derived heading
-                          (not dual-antenna GPS yaw), so leave this off unless the
-                          on-board compass is worse than the Airmar heading.
+                          Off by default. ArduPilot only uses it while the Airmar is the
+                          selected GPS (with <code>GPS_AUTO_SWITCH</code> at its default, when it
+                          has the better fix); otherwise it falls back to the compass. Airmar HDT
+                          is a magnetometer-derived heading (not dual-antenna GPS yaw), so leave
+                          this off unless the on-board compass is worse than the Airmar heading.
                         </div>
 
                         <v-alert

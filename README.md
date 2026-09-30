@@ -119,10 +119,7 @@ In **Setup → Step 2b**, pick the SERIAL port for each stream (`SERIAL6` for wi
 | `SERIAL{Y}_PROTOCOL`         | `5`  | GPS serial → GPS |
 | `GPS1_TYPE` (or `GPS_TYPE`)  | `1`  | **AUTO** — leaves the BlueBoat's onboard u-Blox on GPS1. Legacy `GPS_TYPE` synonym used if `GPS1_TYPE` is absent. |
 | `GPS2_TYPE`                  | `5`  | NMEA — the Airmar's NMEA-over-UDP stream becomes GPS2. |
-| `EK3_SRC2_YAW`               | `2`  | Alternate EKF source set uses GPS yaw |
-| `EK3_SRC2_POSXY`             | `3`  | Alternate EKF source set uses GPS for horizontal position |
-| `EK3_SRC2_VELXY`             | `3`  | Alternate EKF source set uses GPS for horizontal velocity |
-| `EK3_SRC1_YAW` *(opt-in)*    | `3`  | Optional: promote Airmar HDT to primary yaw source with compass fallback |
+| `EK3_SRC1_YAW` *(opt-in)*    | `3`  | Optional: GPS yaw (Airmar HDT) with compass fallback in the active EKF source set |
 
 > **Why GPS1 stays on AUTO, not NMEA.** ArduPilot's `AUTO` (`1`) probes
 > u-Blox, SBP, SiRF, and ERB, which covers the BlueBoat's stock GPS.
@@ -136,6 +133,7 @@ Notes:
 
 - **Apply-once model.** Parameters are only written when you click Apply. A background check compares live values against the applied snapshot every 30 s; if any drift is detected, the UI offers **Restore** (re-apply) or **Ignore** (persist a per-selection "never nag again" flag). Changing the SERIAL indexes or the yaw fallback checkbox counts as a new setup and clears the ignore flag.
 - **UDPIN ignores `SERIALx_BAUD`.** The extension does not write baud so a wired UART on the same index is not silently reconfigured.
+- **With RTK moving baseline** (`GPS1_TYPE = 17`, `GPS2_TYPE = 18`) both GPS slots are taken, so set up wind only (GPS + heading serial: *Not used*); the GPS setup would replace the RTK types.
 - **Missing firmware params are skipped**, not treated as failures — the setup still succeeds on a build without wind-vane support, and the UI reports which rows were unavailable.
 - **Parameters only** (or **Apply parameters** on boards without one-click setup) does not write the BlueOS serial device string: paste the two `udpin` strings manually and reboot the autopilot after Save.
 - **Restart the autopilot** after applying parameters with **Parameters only** that change `SERIALx_PROTOCOL`, `GPS1_TYPE`, `GPS2_TYPE`, or `WNDVN_TYPE` — those are read at boot.

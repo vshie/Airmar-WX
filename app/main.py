@@ -44,6 +44,7 @@ try:
         MAX_SERIAL_INDEX as _MAX_SERIAL_INDEX,
         RECOMMENDED_WIND_SERIAL as _RECOMMENDED_WIND_SERIAL,
         RECOMMENDED_GPS_SERIAL as _RECOMMENDED_GPS_SERIAL,
+        RETIRED_EXPECTED_PARAMS as _RETIRED_EXPECTED_PARAMS,
         build_expected_params,
         diff_current_vs_expected,
         snapshot_from_apply_result,
@@ -583,6 +584,7 @@ class NMEAHandler:
                 # can hit Restore to apply the new contract, or Ignore.
                 self._migrate_autopilot_setup_gps_contract()
                 self._migrate_autopilot_setup_undo_shape()
+                self._migrate_autopilot_setup_drop_src2()
                 # Migration (1.1.10): both routes used to start automatically
                 # on every connect. Installs that already applied the
                 # ArduRover setup depend on that, so keep both on for them;
@@ -612,6 +614,32 @@ class NMEAHandler:
             self.app_logger.debug(f"Saved state: port={self.state['port']}, baud={self.state['baud_rate']}")
         except Exception as e:
             self.app_logger.error(f"Error saving state: {e}")
+
+    def _migrate_autopilot_setup_drop_src2(self):
+        """Stop claiming EKF source set 2 (1.1.4).
+
+        Up to 1.1.3 the GPS setup also wrote EK3_SRC2_YAW/POSXY/VELXY. They
+        are no longer part of the contract (see mavlink_params), so drop
+        them from the persisted `expected` snapshot; otherwise the drift
+        check would nag, and Restore would rewrite them, whenever the
+        operator configures source set 2 for their own use. Values already
+        on the vehicle are left alone, and an `undo` snapshot keeps its
+        pre-setup values so Undo still reverts what an old version wrote.
+        """
+        if not HAS_MAVLINK_PARAMS:
+            return
+        setup = self.state.get('autopilot_setup')
+        if not isinstance(setup, dict) or not isinstance(setup.get('expected'), dict):
+            return
+        dropped = [n for n in _RETIRED_EXPECTED_PARAMS if n in setup['expected']]
+        if not dropped:
+            return
+        for name in dropped:
+            del setup['expected'][name]
+        self.app_logger.info(
+            "No longer managing %s (EKF source set 2 is the operator's)",
+            ", ".join(dropped))
+        self.save_state()
 
     def _migrate_autopilot_setup_undo_shape(self):
         """Keep the one-click setup keys well formed (1.1.1).

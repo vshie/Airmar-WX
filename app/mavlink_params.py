@@ -38,26 +38,32 @@ GPS serial Y (Airmar → GPS2, leaves onboard u-Blox as GPS1):
                                      `GPS_TYPE` on pre-multi-GPS firmwares
     GPS2_TYPE          = 5   (NMEA) — the Airmar's UDP feed
 
-Secondary EKF source set (default): use the Airmar GPS + HDT as a complete
-alternate source that a Lua script or aux switch can promote later. Not
-touched at runtime by ArduPilot until the user selects source set 2 via
-`MAV_CMD_SET_EKF_SOURCE_SET` or `RCx_OPTION=90`. Default
-`EK3_SRC2_POSXY`/`_VELXY` is None, so writing them here is required or the
-alternate set would drop horizontal position:
+How the Airmar is actually used: `GPS2_TYPE = 5` makes it a second GPS
+*candidate*. EKF source sets (`EK3_SRCn_*`) choose a kind of source, not a
+receiver: "GPS" in any set means whichever receiver AP_GPS has selected
+(`selected_gps = gps.primary_sensor()` in AP_NavEKF3_core), which with the
+default `GPS_AUTO_SWITCH = 1` (UseBest) is the one with the better fix. So
+the Airmar feeds the EKF when it wins that choice — typically as a fallback
+when the onboard GPS degrades — and HDT yaw is fused only while it is the
+selected GPS (`readGpsYawData` reads `selected_gps`).
 
-    EK3_SRC2_YAW    = 2  (GPS)
-    EK3_SRC2_POSXY  = 3  (GPS)
-    EK3_SRC2_VELXY  = 3  (GPS)
+We deliberately do NOT write any `EK3_SRC2_*` params. Earlier versions set
+source set 2 to GPS/GPS/GPS-yaw as an "Airmar alternate set", but that
+never selected the Airmar, silently replaced whatever alternate navigation
+the operator had configured there, and `EK3_SRC2_YAW = 2` (GPS yaw, no
+compass fallback) left the EKF without a heading source whenever the
+selected receiver was a u-blox that reports no yaw.
 
-Optional user opt-in (`use_gps_yaw_fallback = True`): promote GPS-reported
-yaw to the *active* source set with compass fallback. The Airmar HDT is a
-magnetometer-derived heading (not dual-antenna GPS yaw), so this is only
-appropriate when the on-board compass is worse than the Airmar heading:
+Optional user opt-in (`use_gps_yaw_fallback = True`): use GPS-reported yaw
+in the *active* source set, with compass fallback. It only takes effect
+while the Airmar is the selected GPS (the u-blox reports no yaw, so the EKF
+falls back to the compass), and the Airmar HDT is itself magnetometer-
+derived, so it only helps when the on-board compass is worse:
 
     EK3_SRC1_YAW = 3  (GPS with compass fallback)
 
-We deliberately leave SRC1_POSXY/VELXY/POSZ alone — the primary set already
-uses the GPS driver for position on the Rover default profile.
+We leave SRC1_POSXY/VELXY/POSZ alone — the primary set already uses GPS
+for position on the Rover default profile.
 
 Apply-once model
 ----------------
@@ -247,11 +253,11 @@ GPS_TYPE_NMEA = 5
 # vehicle's stock GPS wiring.
 GPS_TYPE_AUTO = 1
 
-# EKF3 source enums (see AP_NavEKF_Source).
-EK3_YAW_GPS = 2
+# EKF3 yaw source enum (see AP_NavEKF_Source): 3 = GPS with compass fallback.
 EK3_YAW_GPS_WITH_COMPASS_FALLBACK = 3
-EK3_POSXY_GPS = 3
-EK3_VELXY_GPS = 3
+# Source-set params this extension used to write (<= 1.1.3) and must no
+# longer claim; main.py drops them from persisted `expected` snapshots.
+RETIRED_EXPECTED_PARAMS = ('EK3_SRC2_YAW', 'EK3_SRC2_POSXY', 'EK3_SRC2_VELXY')
 
 
 # ── Public helpers ───────────────────────────────────────────────────
@@ -293,8 +299,10 @@ def build_expected_params(wind_serial: Optional[int],
       stock hardware. We do NOT force NMEA on GPS1 because that would
       break the vehicle's built-in receiver.
     * `GPS2_TYPE = 5` (NMEA) — this is the Airmar. The extension only
-      writes GPS2; the operator wires the Airmar's UDP stream to the
-      autopilot's `SERIAL{gps_serial}` slot via BlueOS.
+      writes GPS2; the Airmar's UDP stream reaches the autopilot's
+      `SERIAL{gps_serial}` slot via BlueOS.
+    * No `EK3_SRC2_*`: source sets can't pick a receiver (see module
+      docstring), and set 2 belongs to the operator.
 
     Earlier versions wrote `GPS1_TYPE = 5`, which forced the primary GPS
     driver into NMEA mode and disabled the onboard u-Blox. Migration in
@@ -313,10 +321,6 @@ def build_expected_params(wind_serial: Optional[int],
             f'SERIAL{gps_serial}_PROTOCOL': float(SERIAL_PROTOCOL_GPS),
             'GPS1_TYPE': float(GPS_TYPE_AUTO),
             'GPS2_TYPE': float(GPS_TYPE_NMEA),
-            # Secondary EKF source set — full alternate GPS-yaw set
-            'EK3_SRC2_YAW': float(EK3_YAW_GPS),
-            'EK3_SRC2_POSXY': float(EK3_POSXY_GPS),
-            'EK3_SRC2_VELXY': float(EK3_VELXY_GPS),
         })
         if use_gps_yaw_fallback:
             exp['EK3_SRC1_YAW'] = float(EK3_YAW_GPS_WITH_COMPASS_FALLBACK)
@@ -958,10 +962,8 @@ __all__ = [
     'WNDVN_TYPE_NMEA',
     'GPS_TYPE_NMEA',
     'GPS_TYPE_AUTO',
-    'EK3_YAW_GPS',
     'EK3_YAW_GPS_WITH_COMPASS_FALLBACK',
-    'EK3_POSXY_GPS',
-    'EK3_VELXY_GPS',
+    'RETIRED_EXPECTED_PARAMS',
     'validate_selection',
     'build_expected_params',
     'snapshot_from_apply_result',

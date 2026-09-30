@@ -90,10 +90,14 @@ class ExpectedParamsTests(unittest.TestCase):
         self.assertEqual(exp['GPS1_TYPE'], 1.0)
         self.assertEqual(exp['GPS2_TYPE'], float(mp.GPS_TYPE_NMEA))
         self.assertEqual(exp['GPS2_TYPE'], 5.0)
-        # SRC2 must be a complete set: yaw + posxy + velxy.
-        self.assertEqual(exp['EK3_SRC2_YAW'], float(mp.EK3_YAW_GPS))
-        self.assertEqual(exp['EK3_SRC2_POSXY'], float(mp.EK3_POSXY_GPS))
-        self.assertEqual(exp['EK3_SRC2_VELXY'], float(mp.EK3_VELXY_GPS))
+        # Source set 2 belongs to the operator: "GPS" in a source set can't
+        # pick the Airmar, and SRC2_YAW=2 had no compass fallback.
+        for name in ('EK3_SRC2_YAW', 'EK3_SRC2_POSXY', 'EK3_SRC2_VELXY'):
+            self.assertNotIn(name, exp)
+        self.assertEqual(set(exp), {
+            'SERIAL2_PROTOCOL', 'WNDVN_TYPE', 'WNDVN_SPEED_TYPE',
+            'SERIAL3_PROTOCOL', 'GPS1_TYPE', 'GPS2_TYPE',
+        })
         # SRC1_YAW must NOT be touched by default (compass).
         self.assertNotIn('EK3_SRC1_YAW', exp)
 

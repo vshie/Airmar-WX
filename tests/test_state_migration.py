@@ -198,8 +198,6 @@ class MigrationTests(unittest.TestCase):
                     'WNDVN_TYPE': 4.0, 'WNDVN_SPEED_TYPE': 4.0,
                     'SERIAL7_PROTOCOL': 5.0,
                     'GPS1_TYPE': 1.0, 'GPS2_TYPE': 5.0,
-                    'EK3_SRC2_YAW': 2.0,
-                    'EK3_SRC2_POSXY': 3.0, 'EK3_SRC2_VELXY': 3.0,
                 },
                 'last_apply_ts': 1790000000.0,
                 'last_apply_result': {},
@@ -331,6 +329,30 @@ class UndoSnapshotMigrationTests(StreamRouteMigrationTests):
     def test_persisted_job_key_stripped(self):
         h = self._load_with({'autopilot_setup': {'job': {'running': True}}})
         self.assertNotIn('job', h.state['autopilot_setup'])
+
+
+class DropSrc2MigrationTests(StreamRouteMigrationTests):
+    """1.1.4: EK3_SRC2_* are no longer part of the parameter contract."""
+
+    def test_src2_dropped_from_expected(self):
+        h = self._load_with({'autopilot_setup': {
+            'applied': True, 'wind_serial': 6, 'gps_serial': 7,
+            'expected': {'SERIAL7_PROTOCOL': 5.0, 'GPS1_TYPE': 1.0, 'GPS2_TYPE': 5.0,
+                         'EK3_SRC2_YAW': 2.0, 'EK3_SRC2_POSXY': 3.0,
+                         'EK3_SRC2_VELXY': 3.0, 'EK3_SRC1_YAW': 3.0}}})
+        self.assertEqual(h.state['autopilot_setup']['expected'],
+                         {'SERIAL7_PROTOCOL': 5.0, 'GPS1_TYPE': 1.0,
+                          'GPS2_TYPE': 5.0, 'EK3_SRC1_YAW': 3.0})
+        self.assertTrue(h.state['autopilot_setup']['applied'])
+
+    def test_undo_snapshot_keeps_src2_originals(self):
+        undo = {'serial_changes': {},
+                'params_before': {'EK3_SRC2_YAW': {'value': 1.0,
+                                                   'resolved_name': 'EK3_SRC2_YAW'}}}
+        h = self._load_with({'autopilot_setup': {
+            'expected': {'EK3_SRC2_YAW': 2.0}, 'undo': undo}})
+        self.assertEqual(h.state['autopilot_setup']['expected'], {})
+        self.assertEqual(h.state['autopilot_setup']['undo'], undo)
 
 
 class PartialApplyTests(unittest.TestCase):
